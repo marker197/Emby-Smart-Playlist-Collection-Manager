@@ -1876,6 +1876,20 @@ canvas {
     <div class="alert" id="refreshAddAllAlert"></div>
   </div>
 
+  <!-- REFRESH DIFF MODAL -->
+  <div class="settings-modal-bg" id="refreshDiffModal">
+    <div class="settings-modal" style="max-width: 500px; max-height: 70vh; overflow-y: auto;">
+      <div class="modal-header">
+        <h3 id="refreshDiffTitle">Refresh complete</h3>
+        <button class="modal-close" onclick="closeRefreshDiff()" style="position: absolute; top: 10px; right: 10px; background: none; border: none; color: var(--text3); cursor: pointer; font-size: 20px;">&times;</button>
+      </div>
+      <div id="refreshDiffBody" style="padding: 15px 0;"></div>
+      <div style="padding-top: 10px; border-top: 1px solid var(--border); margin-top: 15px;">
+        <button id="btnRefreshApply" class="btn btn-secondary" style="width: 100%;">Got it</button>
+      </div>
+    </div>
+  </div>
+
   <!-- REFRESH COLLECTIONS -->
   <div class="card-title" style="margin-top:20px;">
     <svg width="13" height="13" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
@@ -4576,7 +4590,31 @@ function setProgress(barId,labelId,wrapId,pct,label){
 function togglePw(){var i=el('password');i.type=i.type==='password'?'text':'password';}
 function embyH(){return{'Content-Type':'application/json','X-Emby-Token':S.token,'X-Emby-Client':'ChronoPlaylist','X-Emby-Client-Version':'1.0.0','X-Emby-Device-Name':'ChronoPlaylistWeb','X-Emby-Device-Id':'chrono-web'};}
 function apiGet(path){pingNet('emby');return fetch(S.serverUrl+path,{headers:embyH()}).then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.json();});}
-function apiPost(path,body){pingNet('emby');return fetch(S.serverUrl+path,{method:'POST',headers:embyH(),body:body!=null?JSON.stringify(body):undefined}).then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);var ct=r.headers.get('content-type')||'';return ct.indexOf('json')!==-1?r.json():null;});}
+
+// Sync chrono collections to backend for webhook matching
+async function syncChronoCollectionsToBackend() {
+  try {
+    if (!S_savedCollections || S_savedCollections.length === 0) return;
+    
+    const response = await fetch('/api/chrono/sync-metadata', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ collections: S_savedCollections })
+    });
+    
+    if (!response.ok) {
+      console.warn('Chrono sync failed:', response.status);
+      return;
+    }
+    
+    const data = await response.json();
+    if (data.success) {
+      console.log(`✓ Synced ${data.synced} chrono collections to backend`);
+    }
+  } catch (e) {
+    console.warn('Chrono sync error:', e.message);
+  }
+}function apiPost(path,body){pingNet('emby');return fetch(S.serverUrl+path,{method:'POST',headers:embyH(),body:body!=null?JSON.stringify(body):undefined}).then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);var ct=r.headers.get('content-type')||'';return ct.indexOf('json')!==-1?r.json():null;});}
 
 /* Network activity highlighter — pulses the matching panel row briefly */
 var _netTimers={};
@@ -7931,6 +7969,8 @@ function saveCollectionMetadata(embyCollectionId, name, originalTitles, source, 
   
   try {
     localStorage.setItem('cp_saved_collections', JSON.stringify(S_savedCollections));
+    // Also sync to backend for webhook/chrono matching
+    syncChronoCollectionsToBackend();
   } catch(e){
     console.error('  ❌ Failed to save to localStorage:', e.message);
   }
@@ -8189,44 +8229,30 @@ async function doRefreshCollection(){
     
     // Search library for each missing title
     var matched = [];
+    var libraryNames = libraryMovies.map(function(m){ return m.Name; });
+    
     for(var i = 0; i < missingMovies.length; i++){
       var title = missingMovies[i];
       setProgress('collectionProgressBar', 'collectionProgressLabel', 'collectionProgressWrap', 50 + (i / missingMovies.length * 35), 'Searching: '+title+'…');
       
-      // Find matching movie in library using fuzzy matching
+      // EXACT MATCH FIRST
       var m = libraryMovies.find(function(mov){
-        var movTitle = mov.Name || '';
-        if(movTitle === title) return true;
-        
-        // Remove year in parentheses for fuzzy matching
-        var tClean = title.replace(/\s*\(\d{4}\)\s*$/, '').trim();
-        var movClean = movTitle.replace(/\s*\(\d{4}\)\s*$/, '').trim();
-        
-        if(movClean === tClean) return true;
-        
-        // For substring matches, require minimum length and word boundary
-        // Avoid matching "9" with "9/11: Inside the President's War Room"
-        var tLen = tClean.length;
-        var mLen = movClean.length;
-        
-        // If one is significantly shorter, only match if it's at least 5 chars and followed by space/punctuation
-        if(movClean.indexOf(tClean) === 0 && tLen >= 5){
-          // Check if next char is word boundary
-          var nextChar = movClean[tLen];
-          if(!nextChar || /[\s\-:,\.]/.test(nextChar)) return true;
-        }
-        
-        if(tClean.indexOf(movClean) === 0 && mLen >= 5){
-          // Check if next char in search string is word boundary
-          var nextChar = tClean[mLen];
-          if(!nextChar || /[\s\-:,\.]/.test(nextChar)) return true;
-        }
-        
-        return false;
+        return mov.Name === title;
       });
       
-      if(m){
-      } else {
+      // If no exact match, try fuzzy matching
+      if(!m){
+        m = libraryMovies.find(function(mov){
+          var movTitle = mov.Name || '';
+          
+          // Remove year in parentheses for fuzzy matching
+          var tClean = title.replace(/\s*\(\d{4}\)\s*$/, '').trim();
+          var movClean = movTitle.replace(/\s*\(\d{4}\)\s*$/, '').trim();
+          
+          if(movClean === tClean) return true;
+          
+          return false;
+        });
       }
       
       if(m && !currentIds.has(m.Id)){

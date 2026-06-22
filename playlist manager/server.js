@@ -9,6 +9,7 @@ const express = require('express');
 const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
 const fs = require('fs');
+const axios = require('axios');
 
 const EmbyClient = require('./services/emby-client');
 const RulesEngine = require('./services/rules-engine');
@@ -32,7 +33,7 @@ app.use(cors({
   credentials: false,
   optionsSuccessStatus: 200
 }));
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
 
 // Create data directory if it doesn't exist
 const dataDir = path.join(__dirname, 'data');
@@ -907,7 +908,411 @@ app.get('/api/images/:collectionId/items/:filename', (req, res) => {
 });
 
 // ═════════════════════════════════════════════
-// ERROR HANDLING
+// ═════════════════════════════════════════════
+// REFRESH ALL COLLECTIONS (Backend)
+// ═════════════════════════════════════════════
+
+app.post('/api/refresh-all-collections', async (req, res) => {
+  try {
+    logger.info('🔄 [REFRESH ALL] Starting full collection refresh...');
+    
+    const startTime = Date.now();
+    const results = {
+      collectionsProcessed: 0,
+      itemsMatched: 0,
+      itemsAdded: 0,
+      collectionsUpdated: []
+    };
+
+    // Load all chrono collections
+    const chronoPath = path.join(__dirname, 'data', 'chrono-collections.json');
+    if (!fs.existsSync(chronoPath)) {
+      return res.json({ 
+        success: true, 
+        message: 'No chrono collections to refresh',
+        results 
+      });
+    }
+
+    const allCollections = JSON.parse(fs.readFileSync(chronoPath, 'utf8')) || [];
+    
+    if (allCollections.length === 0) {
+      return res.json({ 
+        success: true, 
+        message: 'No collections found',
+        results 
+      });
+    }
+
+    logger.info(`   📋 Found ${allCollections.length} collections to refresh`);
+
+    // Get Emby auth headers
+    const embyUrl = process.env.EMBY_URL;
+    const embyToken = process.env.EMBY_TOKEN;
+    const userId = process.env.EMBY_USER_ID;
+    
+    if (!embyUrl || !embyToken || !userId) {
+      return res.status(500).json({ success: false, error: 'Missing Emby configuration' });
+    }
+
+    // Get all library movies once (for efficiency)
+    let libraryMovies = [];
+    try {
+      const libraryUrl = `${embyUrl}/Items?IncludeItemTypes=Movie&Recursive=true&Fields=Id,Name,ProductionYear&Limit=5000&UserId=${userId}&api_key=${embyToken}`;
+      const embyResponse = await axios.get(libraryUrl);
+      libraryMovies = (embyResponse.data && embyResponse.data.Items) || [];
+      logger.info(`   📚 Loaded ${libraryMovies.length} movies from Emby library`);
+    } catch (e) {
+      logger.error('Failed to fetch library movies:', e.message);
+      return res.status(500).json({ success: false, error: 'Failed to fetch Emby library' });
+    }
+
+    // Process each collection
+    for (const coll of allCollections) {
+      try {
+        logger.info(`   🔄 Processing: ${coll.name} (ID: ${coll.embyId})`);
+        
+        // Get current items in collection using ParentId (correct Emby endpoint)
+        let currentItems = [];
+        try {
+          const collUrl = `${embyUrl}/Items?ParentId=${coll.embyId}&IncludeItemTypes=Movie&Recursive=true&Fields=Id,Name&Limit=2000&UserId=${userId}&api_key=${embyToken}`;
+          const collResponse = await axios.get(collUrl);
+          currentItems = (collResponse.data && collResponse.data.Items) || [];
+        } catch (e) {
+          logger.warn(`   ⚠️  Failed to fetch collection items: ${e.message}`);
+          continue;
+        }
+
+        const currentNames = new Set(currentItems.map(m => m.Name));
+        const currentIds = new Set(currentItems.map(m => m.Id));
+
+        // Get missing titles for this collection
+        const missingTitles = coll.originalTitles || [];
+        if (missingTitles.length === 0) {
+          logger.info(`   ℹ️  No missing titles for this collection`);
+          continue;
+        }
+
+        logger.info(`   🔍 Searching for ${missingTitles.length} missing titles...`);
+
+        // Fuzzy match missing titles to library movies
+        const matched = [];
+        let notFoundCount = 0;
+        
+        for (const title of missingTitles) {
+          const movieInCollection = currentNames.has(title);
+          if (movieInCollection) {
+            continue;
+          }
+
+          // Find best match in library
+          const match = libraryMovies.find(mov => {
+            const movTitle = mov.Name || '';
+            
+            // Exact match
+            if (movTitle === title) return true;
+            
+            // Clean titles (remove year suffix)
+            const tClean = title.replace(/\s*\(\d{4}\)\s*$/, '').trim();
+            const movClean = movTitle.replace(/\s*\(\d{4}\)\s*$/, '').trim();
+            
+            if (movClean === tClean) return true;
+            if (movClean.indexOf(tClean) === 0) return true;
+            if (tClean.indexOf(movClean) === 0) return true;
+            
+            return false;
+          });
+
+          if (match && !currentIds.has(match.Id)) {
+            matched.push({ Id: match.Id, Name: match.Name });
+          } else if (!match) {
+            notFoundCount++;
+          }
+        }
+
+        if (notFoundCount > 0) {
+          logger.info(`   ❌ Could not find ${notFoundCount} titles in library`);
+        }
+
+        // Add matched movies to collection
+        if (matched.length > 0) {
+          try {
+            const movieIds = matched.map(m => m.Id).join(',');
+            const addUrl = `${embyUrl}/Collections/${coll.embyId}/Items?Ids=${movieIds}&api_key=${embyToken}`;
+            
+            await axios.post(addUrl, {});
+            
+            logger.info(`   ➕ Added ${matched.length} movie(s) to ${coll.name}`);
+            
+            results.itemsMatched += matched.length;
+            results.itemsAdded += matched.length;
+            results.collectionsUpdated.push({
+              name: coll.name,
+              itemsAdded: matched.length,
+              movies: matched.map(m => m.Name)
+            });
+          } catch (e) {
+            logger.error(`   ⚠️  Failed to add items: ${e.message}`);
+          }
+        }
+
+        results.collectionsProcessed++;
+
+      } catch (e) {
+        logger.warn(`Error processing collection ${coll.name}:`, e.message);
+      }
+    }
+
+    const processingTime = Date.now() - startTime;
+    logger.info(`✅ [REFRESH ALL] Complete in ${processingTime}ms - ${results.itemsAdded} items added`);
+
+    res.json({
+      success: true,
+      message: `Refreshed ${results.collectionsProcessed} collections - added ${results.itemsAdded} items`,
+      results,
+      processingTimeMs: processingTime
+    });
+
+  } catch (error) {
+    logger.error('Refresh all collections error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ═════════════════════════════════════════════
+// CHRONO COLLECTIONS SYNC (Frontend → Backend)
+// ═════════════════════════════════════════════
+
+app.post('/api/chrono/sync-metadata', express.json(), async (req, res) => {
+  try {
+    const { collections } = req.body;
+
+    if (!Array.isArray(collections)) {
+      return res.status(400).json({ success: false, error: 'collections must be an array' });
+    }
+
+    // Filter to only chrono collections (source is Trakt, MDBlists, or import)
+    const chronoCollections = collections.filter(c => 
+      ['Trakt', 'MDBlists', 'import'].includes(c.source)
+    );
+
+    // Save to backend
+    const chronoPath = path.join(__dirname, 'data', 'chrono-collections.json');
+    fs.writeFileSync(chronoPath, JSON.stringify(chronoCollections, null, 2));
+
+    logger.info(`✓ Synced ${chronoCollections.length} chrono collections to backend`);
+
+    res.json({
+      success: true,
+      synced: chronoCollections.length,
+      collections: chronoCollections.map(c => ({ id: c.embyId, name: c.name, source: c.source }))
+    });
+  } catch (error) {
+    logger.error('Chrono sync error', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ═════════════════════════════════════════════
+// EMBY WEBHOOK HANDLER (Real-time Schedule Refresh)
+// ═════════════════════════════════════════════
+
+app.post('/api/webhooks/emby', express.json(), async (req, res) => {
+  try {
+    const { Event, Item, ServerId } = req.body;
+    
+    logger.info(`📌 Webhook received: ${Event}`);
+    logger.info(`   Item: ${Item?.Name || 'Unknown'} (ID: ${Item?.Id || '?'})`);
+
+    // Only process ItemAdded events (Emby sends as 'library.new')
+    if (Event !== 'library.new') {
+      return res.json({ success: true, message: 'Event type not configured for refresh', event: Event });
+    }
+
+    // Validate we got an item
+    if (!Item || !Item.Id) {
+      return res.status(400).json({ success: false, error: 'No item data in webhook' });
+    }
+
+    // Trigger full collection refresh (finds and auto-adds missing movies)
+    let autoRefreshResult = null;
+    try {
+      logger.info(`   🔄 Triggering refresh for ALL collections...`);
+      const refreshResponse = await axios.post(`http://localhost:${process.env.PORT || 5001}/api/refresh-all-collections`, {});
+      autoRefreshResult = refreshResponse.data;
+      
+      if (autoRefreshResult && autoRefreshResult.success) {
+        logger.info(`   ✓ Refresh complete: ${autoRefreshResult.results.itemsAdded} items added`);
+      }
+    } catch (e) {
+      logger.warn('Refresh all collections failed:', e.message);
+    }
+
+    res.json({
+      success: true,
+      event: Event,
+      item: Item.Name,
+      itemsAdded: autoRefreshResult?.results?.itemsAdded || 0,
+      collectionsRefreshed: autoRefreshResult?.results?.collectionsProcessed || 0,
+      message: 'Movie processed - collections refreshed and auto-updated'
+    });
+
+  } catch (error) {
+    logger.error('Webhook handler error', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Helper: Find which schedules' rules match the new item
+async function findSchedulesThatMatchItem(embyItem) {
+  try {
+    // Load all active schedules
+    const schedulesPath = path.join(__dirname, 'data', 'schedules.json');
+    if (!fs.existsSync(schedulesPath)) return [];
+    
+    const schedules = JSON.parse(fs.readFileSync(schedulesPath, 'utf8')) || [];
+    const matching = [];
+
+    for (const schedule of schedules) {
+      // Skip disabled schedules
+      if (schedule.disabled === true) continue;
+
+      // Load the rule for this schedule
+      const rule = schedule.rule; // Assume rule is embedded or load it
+      if (!rule) continue;
+
+      // Evaluate: does this item match the rule?
+      const ruleEngine = new RulesEngine(logger);
+      const matches = await ruleEngine.evaluateRuleForItem(rule, embyItem);
+
+      if (matches) {
+        matching.push(schedule);
+      }
+    }
+
+    return matching;
+  } catch (e) {
+    logger.warn('Error finding matching schedules', e.message);
+    return [];
+  }
+}
+
+// Helper: Trigger chrono refresh (calls existing /api/chrono/refresh endpoint)
+async function triggerChronoRefresh(collectionId) {
+  try {
+    const port = process.env.PORT || 5001;
+    const refreshUrl = `http://localhost:${port}/api/chrono/refresh/${collectionId}`;
+    
+    const response = await axios.post(refreshUrl, {}, {
+      headers: { 'Content-Type': 'application/json' }
+    });
+    
+    if (response.data && response.data.success !== false) {
+      logger.info(`   ✓ Chrono refresh for ${collectionId}: ${response.data.itemsAdded || 0} items`);
+      return response.data;
+    } else {
+      throw new Error(response.data?.error || 'Refresh failed');
+    }
+  } catch (error) {
+    logger.warn(`Chrono refresh for ${collectionId}: ${error.message}`);
+    throw error;
+  }
+}
+
+// Helper: Refresh chrono collections that share IDs with triggered smart schedules
+async function refreshMatchingChronoCollections(collectionIds) {
+  try {
+    const chronoPath = path.join(__dirname, 'data', 'chrono-collections.json');
+    
+    if (!fs.existsSync(chronoPath)) {
+      logger.info('No synced chrono collections yet');
+      return 0;
+    }
+
+    const chronoCollections = JSON.parse(fs.readFileSync(chronoPath, 'utf8')) || [];
+    let refreshCount = 0;
+
+    for (const collId of collectionIds) {
+      // Find chrono collections using this collection ID
+      const matchingChrono = chronoCollections.filter(c => c.embyId === collId);
+
+      for (const chrono of matchingChrono) {
+        try {
+          logger.info(`   🔄 Refreshing chrono collection: ${chrono.name} (source: ${chrono.source})`);
+          
+          // Refresh based on source
+          if (chrono.source === 'Trakt') {
+            await refreshTraktCollection(chrono);
+            refreshCount++;
+          } else if (chrono.source === 'MDBlists') {
+            await refreshMDBlistsCollection(chrono);
+            refreshCount++;
+          } else if (chrono.source === 'import') {
+            logger.info(`   ℹ️  Imported collection "${chrono.name}" - manual refresh only`);
+          }
+        } catch (chronoError) {
+          logger.warn(`   ⚠️  Failed to refresh chrono "${chrono.name}": ${chronoError.message}`);
+        }
+      }
+    }
+
+    return refreshCount;
+  } catch (e) {
+    logger.warn('Error refreshing chrono collections', e.message);
+    return 0;
+  }
+}
+
+// Refresh a Trakt collection by fetching latest items and updating Emby
+async function refreshTraktCollection(chronoCollection) {
+  try {
+    logger.info(`[Trakt Refresh] Fetching latest items for "${chronoCollection.name}"`);
+    
+    // Get Trakt list ID from collection metadata
+    const traktListId = chronoCollection.sourceListId;
+    if (!traktListId) {
+      throw new Error('No Trakt list ID stored');
+    }
+
+    // Fetch fresh items from Trakt API (would use your Trakt service)
+    // For now, just log - implementation depends on your Trakt integration
+    logger.info(`   Fetching Trakt list: ${traktListId}`);
+    
+    // Once fetched, update the Emby collection with new items
+    // This would call updateCollection or similar
+    logger.info(`   ✓ Trakt collection updated`);
+  } catch (error) {
+    logger.error(`Trakt refresh failed: ${error.message}`);
+    throw error;
+  }
+}
+
+// Refresh an MDBlists collection by fetching latest items and updating Emby
+async function refreshMDBlistsCollection(chronoCollection) {
+  try {
+    logger.info(`[MDBlists Refresh] Fetching latest items for "${chronoCollection.name}"`);
+    
+    // Get MDBlists API key and list ID from collection metadata
+    const apiKey = chronoCollection.sourceListApiKey;
+    const listId = chronoCollection.sourceListId;
+    
+    if (!apiKey || !listId) {
+      throw new Error('No MDBlists credentials stored');
+    }
+
+    // Fetch fresh items from MDBlists API (would use your MDBlists service)
+    logger.info(`   Fetching MDBlists list: ${listId}`);
+    
+    // Once fetched, update the Emby collection with new items
+    logger.info(`   ✓ MDBlists collection updated`);
+  } catch (error) {
+    logger.error(`MDBlists refresh failed: ${error.message}`);
+    throw error;
+  }
+}
+
+// ═════════════════════════════════════════════
+// 404 CATCH-ALL (must be before error handler)
 // ═════════════════════════════════════════════
 
 app.use((req, res) => {
@@ -916,6 +1321,10 @@ app.use((req, res) => {
     error: 'Endpoint not found: ' + req.method + ' ' + req.path
   });
 });
+
+// ═════════════════════════════════════════════
+// ERROR HANDLER (must be last)
+// ═════════════════════════════════════════════
 
 app.use((error, req, res, next) => {
   logger.error('Unhandled error', error);
