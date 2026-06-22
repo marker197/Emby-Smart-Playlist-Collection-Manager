@@ -25,6 +25,7 @@ class ListSyncService {
     this.credentialsPath = path.join(this.dataDir, 'sync-credentials.json');
     this.configPath = path.join(this.dataDir, 'sync-config.json');
     this.auditPath = path.join(this.dataDir, 'sync-audit.json');
+    this.watchedStatePath = path.join(this.dataDir, 'watched-sync-state.json');
     this.backupDir = path.join(this.dataDir, 'backups');
 
     if (!fs.existsSync(this.backupDir)) {
@@ -70,11 +71,21 @@ class ListSyncService {
       lastSync: null,
       nextSync: null,
       autoRadarr: false,
-      radarrServerId: null
+      radarrServerId: null,
+      watchedSyncEnabled: false
     });
   }
 
   loadAudit() { return this.readJSON(this.auditPath, { syncs: [] }); }
+
+  loadWatchedState() {
+    return this.readJSON(this.watchedStatePath, { pushed: {} });
+    // pushed: { "imdb:tt0372784": { trakt: "2026-06-22T...", mdblist: "2026-06-22T..." } }
+  }
+
+  saveWatchedState(state) {
+    this.writeJSONAtomic(this.watchedStatePath, state);
+  }
 
   // ═════════════════════════════════════════════
   // CREDENTIALS (synced from frontend — Trakt token, Radarr servers)
@@ -262,7 +273,7 @@ class ListSyncService {
   }
 
   async fetchCollectionItems(embyId) {
-    const url = `${this.embyUrl}/Items?ParentId=${embyId}&IncludeItemTypes=Movie&Recursive=true&Fields=Id,Name&Limit=2000&UserId=${this.embyUserId}&api_key=${this.embyToken}`;
+    const url = `${this.embyUrl}/Items?ParentId=${embyId}&IncludeItemTypes=Movie&Recursive=true&Fields=Id,Name,ProviderIds,UserData&Limit=2000&UserId=${this.embyUserId}&api_key=${this.embyToken}`;
     const response = await axios.get(url, { timeout: 15000 });
     return (response.data && response.data.Items) || [];
   }
@@ -282,6 +293,11 @@ class ListSyncService {
   async addItemsToEmbyCollection(embyId, movieIds) {
     const url = `${this.embyUrl}/Collections/${embyId}/Items?Ids=${movieIds.join(',')}&api_key=${this.embyToken}`;
     await axios.post(url, {});
+  }
+
+  async removeItemsFromEmbyCollection(embyId, movieIds) {
+    const url = `${this.embyUrl}/Collections/${embyId}/Items?Ids=${movieIds.join(',')}&api_key=${this.embyToken}`;
+    await axios.delete(url);
   }
 
   // ═════════════════════════════════════════════
@@ -358,6 +374,265 @@ class ListSyncService {
   }
 
   // ═════════════════════════════════════════════
+  // WATCHED SYNC (Emby → Trakt / MDBlists)
+  // Pushes movies marked Played in Emby back to the source service.
+  // ═════════════════════════════════════════════
+
+  // Batched single call — Trakt accepts an array, no need for one request per movie
+  async pushWatchedToTrakt(movies, creds) {
+    if (!movies.length) return { succeeded: [], notFound: [], error: null };
+    if (!creds || !creds.trakt || !creds.trakt.accessToken) {
+      return { succeeded: [], notFound: [], error: 'Trakt not connected' };
+    }
+
+    const headers = {
+      'Authorization': 'Bearer ' + creds.trakt.accessToken,
+      'Content-Type': 'application/json',
+      'trakt-api-version': '2',
+      'trakt-api-key': creds.trakt.clientId || ''
+    };
+
+    try {
+      const response = await axios.post('https://api.trakt.tv/sync/history', {
+        movies: movies.map(m => ({
+          ids: m.imdb ? { imdb: m.imdb } : { tmdb: parseInt(m.tmdb, 10) },
+          watched_at: m.watchedAt
+        }))
+      }, { headers, timeout: 15000 });
+
+      const notFoundKeys = new Set((response.data.not_found.movies || []).map(m =>
+        (m.ids && (m.ids.imdb || m.ids.tmdb)) || ''
+      ));
+
+      const succeeded = movies.filter(m => !notFoundKeys.has(m.imdb || String(m.tmdb)));
+      const notFound = movies.filter(m => notFoundKeys.has(m.imdb || String(m.tmdb)));
+
+      return { succeeded, notFound, error: null, raw: response.data };
+    } catch (e) {
+      const status = e.response ? e.response.status : '???';
+      this.logger.warn(`Trakt watched-sync failed [${status}]: ${e.message}`);
+      return { succeeded: [], notFound: [], error: `Trakt HTTP ${status}` };
+    }
+  }
+
+  // Batched per API key — each MDBlists-sourced collection may use a different key
+  async pushWatchedToMDBList(movies, apiKey) {
+    if (!movies.length) return { succeeded: [], notFound: [], error: null };
+    if (!apiKey) return { succeeded: [], notFound: [], error: 'No MDBlists API key' };
+
+    try {
+      const response = await axios.post(
+        `https://api.mdblist.com/sync/watched?apikey=${apiKey}`,
+        {
+          movies: movies.map(m => ({
+            ids: m.imdb ? { imdb: m.imdb, tmdb: m.tmdb ? parseInt(m.tmdb, 10) : undefined }
+                        : { tmdb: parseInt(m.tmdb, 10) },
+            watched_at: m.watchedAt
+          }))
+        },
+        { headers: { 'Content-Type': 'application/json' }, timeout: 15000 }
+      );
+
+      const notFoundKeys = new Set((response.data.not_found.movies || []).map(m =>
+        (m.ids && (m.ids.imdb || m.ids.tmdb)) || ''
+      ));
+
+      const succeeded = movies.filter(m => !notFoundKeys.has(m.imdb || String(m.tmdb)));
+      const notFound = movies.filter(m => notFoundKeys.has(m.imdb || String(m.tmdb)));
+
+      return { succeeded, notFound, error: null, raw: response.data };
+    } catch (e) {
+      const status = e.response ? e.response.status : '???';
+      this.logger.warn(`MDBlists watched-sync failed [${status}]: ${e.message}`);
+      return { succeeded: [], notFound: [], error: `MDBlists HTTP ${status}` };
+    }
+  }
+
+  // Collect newly-Played movies from every tracked Trakt/MDBlists collection,
+  // skip anything already pushed (per-service), then batch-push.
+  async syncWatchedStatus(options = {}) {
+    const dryRun = !!options.dryRun;
+    const collections = this.loadCollections();
+    const creds = this.loadCredentials();
+    const watchedState = this.loadWatchedState();
+
+    const result = {
+      success: true,
+      dryRun,
+      traktPushed: [],
+      traktNotFound: [],
+      mdblistPushed: [],
+      mdblistNotFound: [],
+      skippedNoId: [],
+      errors: []
+    };
+
+    // ---- Trakt: one combined batch across all Trakt-sourced collections ----
+    const traktCollections = collections.filter(c => c.source === 'Trakt');
+    const traktCandidates = [];
+
+    for (const coll of traktCollections) {
+      let items = [];
+      try {
+        items = await this.fetchCollectionItems(coll.embyId);
+      } catch (e) {
+        result.errors.push({ collection: coll.name, error: e.message });
+        continue;
+      }
+
+      const watched = items.filter(i => i.UserData && i.UserData.Played);
+      for (const item of watched) {
+        const imdb = item.ProviderIds && (item.ProviderIds.Imdb || item.ProviderIds.IMDB);
+        const tmdb = item.ProviderIds && (item.ProviderIds.Tmdb || item.ProviderIds.TMDB);
+        if (!imdb && !tmdb) { result.skippedNoId.push(item.Name); continue; }
+
+        const key = 'trakt:' + (imdb || tmdb);
+        if (watchedState.pushed[key]) continue; // already pushed in a previous run
+
+        traktCandidates.push({
+          name: item.Name,
+          imdb: imdb || null,
+          tmdb: tmdb || null,
+          watchedAt: item.UserData.LastPlayedDate || new Date().toISOString(),
+          _key: key
+        });
+      }
+    }
+
+    if (traktCandidates.length) {
+      if (dryRun) {
+        result.traktPushed = traktCandidates.map(m => ({ name: m.name, imdb: m.imdb, tmdb: m.tmdb }));
+      } else {
+        const pushResult = await this.pushWatchedToTrakt(traktCandidates, creds);
+        if (pushResult.error) {
+          result.errors.push({ service: 'trakt', error: pushResult.error });
+        } else {
+          pushResult.succeeded.forEach(m => { watchedState.pushed[m._key] = { ...(watchedState.pushed[m._key]||{}), trakt: new Date().toISOString() }; });
+          result.traktPushed = pushResult.succeeded.map(m => ({ name: m.name, imdb: m.imdb, tmdb: m.tmdb }));
+          result.traktNotFound = pushResult.notFound.map(m => m.name);
+        }
+      }
+    }
+
+    // ---- MDBlists: grouped per API key, since different collections may use different keys ----
+    const mdblistCollections = collections.filter(c => c.source === 'MDBlists' && c.sourceListApiKey);
+    const byApiKey = new Map();
+    for (const coll of mdblistCollections) {
+      if (!byApiKey.has(coll.sourceListApiKey)) byApiKey.set(coll.sourceListApiKey, []);
+      byApiKey.get(coll.sourceListApiKey).push(coll);
+    }
+
+    for (const [apiKey, colls] of byApiKey.entries()) {
+      const mdbCandidates = [];
+
+      for (const coll of colls) {
+        let items = [];
+        try {
+          items = await this.fetchCollectionItems(coll.embyId);
+        } catch (e) {
+          result.errors.push({ collection: coll.name, error: e.message });
+          continue;
+        }
+
+        const watched = items.filter(i => i.UserData && i.UserData.Played);
+        for (const item of watched) {
+          const imdb = item.ProviderIds && (item.ProviderIds.Imdb || item.ProviderIds.IMDB);
+          const tmdb = item.ProviderIds && (item.ProviderIds.Tmdb || item.ProviderIds.TMDB);
+          if (!imdb && !tmdb) continue; // already counted in skippedNoId via Trakt pass if shared; avoid double-count otherwise
+
+          const key = 'mdblist:' + (imdb || tmdb) + ':' + apiKey.slice(-6);
+          if (watchedState.pushed[key]) continue;
+
+          mdbCandidates.push({
+            name: item.Name,
+            imdb: imdb || null,
+            tmdb: tmdb || null,
+            watchedAt: item.UserData.LastPlayedDate || new Date().toISOString(),
+            _key: key
+          });
+        }
+      }
+
+      if (!mdbCandidates.length) continue;
+
+      if (dryRun) {
+        result.mdblistPushed.push(...mdbCandidates.map(m => ({ name: m.name, imdb: m.imdb, tmdb: m.tmdb })));
+      } else {
+        const pushResult = await this.pushWatchedToMDBList(mdbCandidates, apiKey);
+        if (pushResult.error) {
+          result.errors.push({ service: 'mdblist', error: pushResult.error });
+        } else {
+          pushResult.succeeded.forEach(m => { watchedState.pushed[m._key] = { ...(watchedState.pushed[m._key]||{}), mdblist: new Date().toISOString() }; });
+          result.mdblistPushed.push(...pushResult.succeeded.map(m => ({ name: m.name, imdb: m.imdb, tmdb: m.tmdb })));
+          result.mdblistNotFound.push(...pushResult.notFound.map(m => m.name));
+        }
+      }
+    }
+
+    if (!dryRun) this.saveWatchedState(watchedState);
+
+    if (result.traktPushed.length || result.mdblistPushed.length) {
+      this.logger.info(`✅ [WATCHED SYNC] Trakt: ${result.traktPushed.length} pushed, MDBlists: ${result.mdblistPushed.length} pushed${dryRun ? ' (dry run)' : ''}`);
+    } else {
+      this.logger.info(`✅ [WATCHED SYNC] Nothing new to push`);
+    }
+
+    return result;
+  }
+
+  // Webhook-driven single-item push — fires on Emby's item.markplayed event.
+  // Reuses the same state file as syncWatchedStatus() so neither path double-pushes
+  // work the other already did. Title match is in-memory only, no Emby API calls.
+  async pushWatchedSingleItem({ name, imdb, tmdb, watchedAt }) {
+    const collections = this.loadCollections();
+    const creds = this.loadCredentials();
+    const watchedState = this.loadWatchedState();
+    const idKey = imdb || tmdb;
+    const movie = { name, imdb, tmdb, watchedAt: watchedAt || new Date().toISOString() };
+
+    const result = { traktPushed: false, mdblistPushed: [] };
+
+    const inTraktList = collections.some(c =>
+      c.source === 'Trakt' && (c.importedTitles || c.originalTitles || []).includes(name)
+    );
+
+    if (inTraktList) {
+      const key = 'trakt:' + idKey;
+      if (!watchedState.pushed[key]) {
+        const r = await this.pushWatchedToTrakt([movie], creds);
+        if (r.error) {
+          this.logger.warn(`   Webhook watched-push to Trakt failed: ${r.error}`);
+        } else if (r.succeeded.length) {
+          watchedState.pushed[key] = { ...(watchedState.pushed[key] || {}), trakt: movie.watchedAt };
+          result.traktPushed = true;
+        }
+      }
+    }
+
+    const mdblistKeys = new Set(
+      collections
+        .filter(c => c.source === 'MDBlists' && c.sourceListApiKey && (c.importedTitles || c.originalTitles || []).includes(name))
+        .map(c => c.sourceListApiKey)
+    );
+
+    for (const apiKey of mdblistKeys) {
+      const key = 'mdblist:' + idKey + ':' + apiKey.slice(-6); // distinct per key, in case of multiple MDBlists accounts
+      if (watchedState.pushed[key]) continue;
+
+      const r = await this.pushWatchedToMDBList([movie], apiKey);
+      if (r.error) {
+        this.logger.warn(`   Webhook watched-push to MDBlists failed: ${r.error}`);
+      } else if (r.succeeded.length) {
+        watchedState.pushed[key] = { ...(watchedState.pushed[key] || {}), mdblist: movie.watchedAt };
+        result.mdblistPushed.push(apiKey);
+      }
+    }
+
+    this.saveWatchedState(watchedState);
+    return result;
+  }
+
+  // ═════════════════════════════════════════════
   // PER-COLLECTION SYNC
   // ═════════════════════════════════════════════
 
@@ -375,7 +650,9 @@ class ListSyncService {
       removed: [],
       missingFromLibrary: [],
       addedToEmby: [],
-      radarrQueued: []
+      removedFromEmby: [],
+      radarrQueued: [],
+      radarrWouldSend: false
     };
 
     try {
@@ -445,6 +722,24 @@ class ListSyncService {
           }
         }
 
+        // Anything that fell off the source list AND is still physically in the
+        // Emby collection gets removed too — same safety net as above already
+        // validated this via validateChanges()'s >50%-removed guard.
+        const toRemove = result.removed
+          .filter(title => currentNames.has(title))
+          .map(title => currentItems.find(m => m.Name === title))
+          .filter(Boolean);
+
+        if (toRemove.length > 0) {
+          try {
+            await this.removeItemsFromEmbyCollection(coll.embyId, toRemove.map(m => m.Id));
+            result.removedFromEmby = toRemove.map(m => m.Name);
+            result.changed = true;
+          } catch (e) {
+            this.logger.warn(`   Failed to remove items from Emby collection "${coll.name}": ${e.message}`);
+          }
+        }
+
         result.missingFromLibrary = stillMissing;
 
         // Persist the full picture onto the collection record itself —
@@ -463,16 +758,16 @@ class ListSyncService {
       // OR if the global "auto-send all list updates" setting is on
       // (mirrors the existing manual-refresh behaviour — Radarr no-ops on dupes)
       const radarrEnabled = !!coll.radarrAutoSend || !!options.globalRadarr;
-      if (!options.dryRun && radarrEnabled && result.missingFromLibrary.length > 0) {
-        const serverId = (coll.radarrAutoSend && coll.radarrServerId !== undefined && coll.radarrServerId !== null)
-          ? coll.radarrServerId
-          : options.globalRadarrServerId;
-        const server = creds.radarrServers && creds.radarrServers[serverId];
-        if (server && server.url && server.apiKey) {
-          for (const title of result.missingFromLibrary) {
-            const sent = await this.sendToRadarr(title, server);
-            if (sent.status === 'sent') result.radarrQueued.push(title);
-          }
+      const radarrServerId = (coll.radarrAutoSend && coll.radarrServerId !== undefined && coll.radarrServerId !== null)
+        ? coll.radarrServerId
+        : options.globalRadarrServerId;
+      const radarrServer = creds.radarrServers && creds.radarrServers[radarrServerId];
+      result.radarrWouldSend = !!(radarrEnabled && result.missingFromLibrary.length > 0 && radarrServer && radarrServer.url && radarrServer.apiKey);
+
+      if (!options.dryRun && radarrEnabled && result.missingFromLibrary.length > 0 && radarrServer && radarrServer.url && radarrServer.apiKey) {
+        for (const title of result.missingFromLibrary) {
+          const sent = await this.sendToRadarr(title, radarrServer);
+          if (sent.status === 'sent') result.radarrQueued.push(title);
         }
       }
 
@@ -508,6 +803,7 @@ class ListSyncService {
       totalAdded: 0,
       totalRemoved: 0,
       totalAddedToEmby: 0,
+      totalRemovedFromEmby: 0,
       totalRadarrQueued: 0,
       collections: [],
       errors: []
@@ -563,7 +859,7 @@ class ListSyncService {
         }
 
         anyProcessed = true;
-        this.logger.info(`   • ${coll.name} (${coll.source}): +${result.added.length} / -${result.removed.length}${result.addedToEmby.length ? `, ${result.addedToEmby.length} added to Emby collection` : ''}${result.missingFromLibrary.length ? `, ${result.missingFromLibrary.length} missing from library` : ''}`);
+        this.logger.info(`   • ${coll.name} (${coll.source}): +${result.added.length} / -${result.removed.length}${result.addedToEmby.length ? `, ${result.addedToEmby.length} added to Emby collection` : ''}${result.removedFromEmby.length ? `, ${result.removedFromEmby.length} removed from Emby collection` : ''}${result.missingFromLibrary.length ? `, ${result.missingFromLibrary.length} missing from library` : ''}`);
 
         if (result.changed) {
           summary.collectionsChanged++;
@@ -571,9 +867,10 @@ class ListSyncService {
           summary.totalRemoved += result.removed.length;
         }
         summary.totalAddedToEmby += result.addedToEmby.length;
+        summary.totalRemovedFromEmby += result.removedFromEmby.length;
         summary.totalRadarrQueued += result.radarrQueued.length;
 
-        if (result.changed || result.radarrQueued.length > 0 || result.idHealed) {
+        if (dryRun || result.changed || result.radarrQueued.length > 0 || result.idHealed) {
           summary.collections.push({
             id: result.id,
             name: result.name,
@@ -581,8 +878,10 @@ class ListSyncService {
             added: result.added,
             removed: result.removed,
             addedToEmby: result.addedToEmby,
+            removedFromEmby: result.removedFromEmby,
             missingFromLibrary: result.missingFromLibrary,
             radarrQueued: result.radarrQueued,
+            radarrWouldSend: result.radarrWouldSend,
             idHealed: result.idHealed
           });
         }
@@ -595,8 +894,24 @@ class ListSyncService {
         this.writeJSONAtomic(this.chronoPath, collections);
       }
 
-      if (summary.collectionsChanged > 0 || summary.totalAddedToEmby > 0) {
-        this.logger.info(`✅ [LIST SYNC] ${summary.collectionsChanged} list(s) updated — +${summary.totalAdded} / -${summary.totalRemoved}${summary.totalAddedToEmby ? `, ${summary.totalAddedToEmby} added to Emby` : ''}${summary.totalRadarrQueued ? `, ${summary.totalRadarrQueued} sent to Radarr` : ''}`);
+      // Watched-status push (Emby → Trakt/MDBlists) — opt-in, runs as part of the same cycle
+      if (config.watchedSyncEnabled) {
+        try {
+          const watchedResult = await this.syncWatchedStatus({ dryRun });
+          summary.watchedSync = {
+            traktPushed: watchedResult.traktPushed,
+            mdblistPushed: watchedResult.mdblistPushed,
+            skippedNoId: watchedResult.skippedNoId,
+            errors: watchedResult.errors
+          };
+        } catch (e) {
+          this.logger.warn('Watched sync step failed: ' + e.message);
+          summary.watchedSync = { error: e.message };
+        }
+      }
+
+      if (summary.collectionsChanged > 0 || summary.totalAddedToEmby > 0 || summary.totalRemovedFromEmby > 0) {
+        this.logger.info(`✅ [LIST SYNC] ${summary.collectionsChanged} list(s) updated — +${summary.totalAdded} / -${summary.totalRemoved}${summary.totalAddedToEmby ? `, ${summary.totalAddedToEmby} added to Emby` : ''}${summary.totalRemovedFromEmby ? `, ${summary.totalRemovedFromEmby} removed from Emby` : ''}${summary.totalRadarrQueued ? `, ${summary.totalRadarrQueued} sent to Radarr` : ''}`);
       } else {
         this.logger.info(`✅ [LIST SYNC] Complete — no changes detected`);
       }

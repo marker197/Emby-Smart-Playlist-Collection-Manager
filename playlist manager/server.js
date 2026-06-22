@@ -1165,6 +1165,35 @@ app.get('/api/chrono/missing-lists', (req, res) => {
   }
 });
 
+// Smart rule preview — real match count against the live library, no rule is saved
+app.post('/api/rules/preview', express.json(), async (req, res) => {
+  try {
+    const { logic, conditions } = req.body;
+
+    if (!Array.isArray(conditions) || conditions.length === 0) {
+      return res.status(400).json({ success: false, error: 'No conditions provided' });
+    }
+
+    const items = await embyClient.getLibraryItems();
+    const rule = { type: logic || 'AND', logic: logic || 'AND', conditions };
+    const matched = rulesEngine.evaluateRule(rule, items);
+
+    res.json({
+      success: true,
+      count: matched.length,
+      totalLibrarySize: items.length,
+      sample: matched.slice(0, 20).map(i => ({
+        id: i.Id,
+        name: i.Name,
+        year: i.ProductionYear || null
+      }))
+    });
+  } catch (error) {
+    logger.error('Rule preview error', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // Manual "Sync Now" trigger (also used by the scheduled timer internally)
 app.post('/api/sync-lists', express.json(), async (req, res) => {
   try {
@@ -1190,17 +1219,30 @@ app.get('/api/sync-status', (req, res) => {
 // Update auto-sync settings (enabled, intervalHours)
 app.post('/api/sync-settings', express.json(), async (req, res) => {
   try {
-    const { enabled, intervalHours, autoRadarr, radarrServerId } = req.body;
+    const { enabled, intervalHours, autoRadarr, radarrServerId, watchedSyncEnabled } = req.body;
     const updates = {};
     if (typeof enabled === 'boolean') updates.enabled = enabled;
     if (typeof intervalHours === 'number' && intervalHours > 0) updates.intervalHours = intervalHours;
     if (typeof autoRadarr === 'boolean') updates.autoRadarr = autoRadarr;
     if (radarrServerId === null || typeof radarrServerId === 'number') updates.radarrServerId = radarrServerId;
+    if (typeof watchedSyncEnabled === 'boolean') updates.watchedSyncEnabled = watchedSyncEnabled;
 
     const updated = listSyncService.saveConfig(updates);
     res.json({ success: true, config: updated });
   } catch (error) {
     logger.error('Sync settings error', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Manual trigger / preview for watched-status sync (Emby → Trakt/MDBlists), independent of list-content sync
+app.post('/api/sync-watched', express.json(), async (req, res) => {
+  try {
+    const dryRun = !!(req.body && req.body.dryRun);
+    const result = await listSyncService.syncWatchedStatus({ dryRun });
+    res.json(result);
+  } catch (error) {
+    logger.error('Watched sync error', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
@@ -1211,43 +1253,79 @@ app.post('/api/sync-settings', express.json(), async (req, res) => {
 
 app.post('/api/webhooks/emby', express.json(), async (req, res) => {
   try {
-    const { Event, Item, ServerId } = req.body;
-    
+    const { Event, Item } = req.body;
+
     logger.info(`📌 Webhook received: ${Event}`);
     logger.info(`   Item: ${Item?.Name || 'Unknown'} (ID: ${Item?.Id || '?'})`);
 
-    // Only process ItemAdded events (Emby sends as 'library.new')
-    if (Event !== 'library.new') {
-      return res.json({ success: true, message: 'Event type not configured for refresh', event: Event });
-    }
-
-    // Validate we got an item
-    if (!Item || !Item.Id) {
-      return res.status(400).json({ success: false, error: 'No item data in webhook' });
-    }
-
-    // Trigger full collection refresh (finds and auto-adds missing movies)
-    let autoRefreshResult = null;
-    try {
-      logger.info(`   🔄 Triggering refresh for ALL collections...`);
-      const refreshResponse = await axios.post(`http://localhost:${process.env.PORT || 5001}/api/refresh-all-collections`, {});
-      autoRefreshResult = refreshResponse.data;
-      
-      if (autoRefreshResult && autoRefreshResult.success) {
-        logger.info(`   ✓ Refresh complete: ${autoRefreshResult.results.itemsAdded} items added`);
+    // ─── New item added to library → refresh collections ───
+    if (Event === 'library.new') {
+      if (!Item || !Item.Id) {
+        return res.status(400).json({ success: false, error: 'No item data in webhook' });
       }
-    } catch (e) {
-      logger.warn('Refresh all collections failed:', e.message);
+
+      let autoRefreshResult = null;
+      try {
+        logger.info(`   🔄 Triggering refresh for ALL collections...`);
+        const refreshResponse = await axios.post(`http://localhost:${process.env.PORT || 5001}/api/refresh-all-collections`, {});
+        autoRefreshResult = refreshResponse.data;
+
+        if (autoRefreshResult && autoRefreshResult.success) {
+          logger.info(`   ✓ Refresh complete: ${autoRefreshResult.results.itemsAdded} items added`);
+        }
+      } catch (e) {
+        logger.warn('Refresh all collections failed:', e.message);
+      }
+
+      return res.json({
+        success: true,
+        event: Event,
+        item: Item.Name,
+        itemsAdded: autoRefreshResult?.results?.itemsAdded || 0,
+        collectionsRefreshed: autoRefreshResult?.results?.collectionsProcessed || 0,
+        message: 'Movie processed - collections refreshed and auto-updated'
+      });
     }
 
-    res.json({
-      success: true,
-      event: Event,
-      item: Item.Name,
-      itemsAdded: autoRefreshResult?.results?.itemsAdded || 0,
-      collectionsRefreshed: autoRefreshResult?.results?.collectionsProcessed || 0,
-      message: 'Movie processed - collections refreshed and auto-updated'
-    });
+    // ─── Item marked watched → push to Trakt/MDBlists if tracked ───
+    if (Event === 'item.markplayed') {
+      if (!Item || !Item.Id) {
+        return res.status(400).json({ success: false, error: 'No item data in webhook' });
+      }
+
+      const config = listSyncService.loadConfig();
+      if (!config.watchedSyncEnabled) {
+        logger.info(`   Watched-sync is disabled in settings — ignoring`);
+        return res.json({ success: true, message: 'Watched-sync disabled in settings', event: Event });
+      }
+
+      if (Item.Type !== 'Movie') {
+        logger.info(`   Skipping — only movies are supported currently (got ${Item.Type})`);
+        return res.json({ success: true, message: 'Only movies are supported currently', event: Event });
+      }
+
+      const imdb = Item.ProviderIds && Item.ProviderIds.Imdb;
+      const tmdb = Item.ProviderIds && Item.ProviderIds.Tmdb;
+      if (!imdb && !tmdb) {
+        logger.warn(`   No IMDB/TMDB id on "${Item.Name}" — cannot push`);
+        return res.json({ success: true, message: 'No IMDB/TMDB id, cannot push', event: Event });
+      }
+
+      const watchedAt = (Item.UserData && Item.UserData.LastPlayedDate) || new Date().toISOString();
+
+      let pushResult = { traktPushed: false, mdblistPushed: [] };
+      try {
+        pushResult = await listSyncService.pushWatchedSingleItem({ name: Item.Name, imdb, tmdb, watchedAt });
+        logger.info(`   ✓ Watched-push for "${Item.Name}": Trakt=${pushResult.traktPushed}, MDBlists keys=${pushResult.mdblistPushed.length}`);
+      } catch (e) {
+        logger.warn('   Watched single-item push failed: ' + e.message);
+      }
+
+      return res.json({ success: true, event: Event, item: Item.Name, ...pushResult });
+    }
+
+    // ─── Anything else → acknowledge, do nothing ───
+    return res.json({ success: true, message: 'Event type not configured', event: Event });
 
   } catch (error) {
     logger.error('Webhook handler error', error);
