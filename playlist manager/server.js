@@ -18,6 +18,7 @@ const EmailService = require('./services/email-service');
 const Logger = require('./services/logger');
 const MDBListService = require('./services/mdblist-service');
 const ImageService = require('./services/image-service');
+const ListSyncService = require('./services/list-sync-service');
 
 // ═════════════════════════════════════════════
 // INITIALIZATION
@@ -134,6 +135,14 @@ const emailService = (process.env.GMAIL_ADDRESS && process.env.GMAIL_APP_PASSWOR
       logger
     )
   : null;
+
+const listSyncService = new ListSyncService({
+  dataDir: path.join(__dirname, 'data'),
+  logger,
+  embyUrl: process.env.EMBY_URL,
+  embyToken: process.env.EMBY_TOKEN,
+  embyUserId: process.env.EMBY_USER_ID
+});
 
 // ═════════════════════════════════════════════
 // HEALTH CHECK & STATUS
@@ -1114,6 +1123,89 @@ app.post('/api/chrono/sync-metadata', express.json(), async (req, res) => {
 });
 
 // ═════════════════════════════════════════════
+// LIST SYNC (Trakt/MDBlists auto-download + Radarr)
+// ═════════════════════════════════════════════
+
+// Frontend pushes Trakt token + Radarr servers here so the backend can sync without the browser open
+app.post('/api/credentials/sync', express.json(), async (req, res) => {
+  try {
+    const { trakt, radarrServers } = req.body;
+    const updated = listSyncService.saveCredentials({
+      ...(trakt !== undefined ? { trakt } : {}),
+      ...(radarrServers !== undefined ? { radarrServers } : {})
+    });
+    res.json({
+      success: true,
+      traktConnected: !!(updated.trakt && updated.trakt.accessToken),
+      radarrServerCount: (updated.radarrServers || []).length
+    });
+  } catch (error) {
+    logger.error('Credentials sync error', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Current missing-title list per collection (post-sync), keyed by embyId —
+// lets the frontend catch up its localStorage cache after a background sync
+app.get('/api/chrono/missing-lists', (req, res) => {
+  try {
+    const chronoPath = path.join(__dirname, 'data', 'chrono-collections.json');
+    if (!fs.existsSync(chronoPath)) {
+      return res.json({ success: true, lists: {} });
+    }
+    const collections = JSON.parse(fs.readFileSync(chronoPath, 'utf8') || '[]');
+    const lists = {};
+    collections.forEach(c => {
+      if (Array.isArray(c.missingTitles)) lists[c.embyId] = c.missingTitles;
+    });
+    res.json({ success: true, lists });
+  } catch (error) {
+    logger.error('Missing lists fetch error', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Manual "Sync Now" trigger (also used by the scheduled timer internally)
+app.post('/api/sync-lists', express.json(), async (req, res) => {
+  try {
+    const dryRun = !!(req.body && req.body.dryRun);
+    const result = await listSyncService.syncAll({ dryRun });
+    res.json(result);
+  } catch (error) {
+    logger.error('Sync lists error', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Current settings + last run + short history
+app.get('/api/sync-status', (req, res) => {
+  try {
+    res.json({ success: true, ...listSyncService.getStatus() });
+  } catch (error) {
+    logger.error('Sync status error', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Update auto-sync settings (enabled, intervalHours)
+app.post('/api/sync-settings', express.json(), async (req, res) => {
+  try {
+    const { enabled, intervalHours, autoRadarr, radarrServerId } = req.body;
+    const updates = {};
+    if (typeof enabled === 'boolean') updates.enabled = enabled;
+    if (typeof intervalHours === 'number' && intervalHours > 0) updates.intervalHours = intervalHours;
+    if (typeof autoRadarr === 'boolean') updates.autoRadarr = autoRadarr;
+    if (radarrServerId === null || typeof radarrServerId === 'number') updates.radarrServerId = radarrServerId;
+
+    const updated = listSyncService.saveConfig(updates);
+    res.json({ success: true, config: updated });
+  } catch (error) {
+    logger.error('Sync settings error', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ═════════════════════════════════════════════
 // EMBY WEBHOOK HANDLER (Real-time Schedule Refresh)
 // ═════════════════════════════════════════════
 
@@ -1352,6 +1444,8 @@ const server = app.listen(PORT, () => {
   logger.info(`═══════════════════════════════════════════`);
   logger.info(`Health check: http://localhost:${PORT}/api/health`);
   logger.info(`═══════════════════════════════════════════`);
+
+  listSyncService.start();
 });
 
 // Graceful shutdown

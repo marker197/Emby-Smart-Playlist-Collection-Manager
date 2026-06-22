@@ -1,0 +1,671 @@
+// ═════════════════════════════════════════════
+// List Sync Service
+// Auto-downloads changes from Trakt/MDBlists, updates stored
+// chrono collections, and optionally queues missing items to Radarr.
+// ═════════════════════════════════════════════
+
+const fs = require('fs');
+const path = require('path');
+const axios = require('axios');
+
+const SAFETY_LIMITS = {
+  MAX_PERCENT_REMOVED: 50,   // warn if more than half a list disappears
+  MAX_BACKUPS: 5             // keep this many .bak snapshots
+};
+
+class ListSyncService {
+  constructor(options) {
+    this.dataDir = options.dataDir;
+    this.logger = options.logger;
+    this.embyUrl = options.embyUrl;
+    this.embyToken = options.embyToken;
+    this.embyUserId = options.embyUserId;
+
+    this.chronoPath = path.join(this.dataDir, 'chrono-collections.json');
+    this.credentialsPath = path.join(this.dataDir, 'sync-credentials.json');
+    this.configPath = path.join(this.dataDir, 'sync-config.json');
+    this.auditPath = path.join(this.dataDir, 'sync-audit.json');
+    this.backupDir = path.join(this.dataDir, 'backups');
+
+    if (!fs.existsSync(this.backupDir)) {
+      fs.mkdirSync(this.backupDir, { recursive: true });
+    }
+
+    this.timer = null;
+    this.isSyncing = false;
+  }
+
+  // ═════════════════════════════════════════════
+  // FILE HELPERS
+  // ═════════════════════════════════════════════
+
+  readJSON(file, fallback) {
+    try {
+      if (!fs.existsSync(file)) return fallback;
+      const raw = fs.readFileSync(file, 'utf8');
+      if (!raw || !raw.trim()) return fallback;
+      return JSON.parse(raw);
+    } catch (e) {
+      this.logger.warn(`List sync: could not read ${path.basename(file)}: ${e.message}`);
+      return fallback;
+    }
+  }
+
+  writeJSONAtomic(file, data) {
+    const tmp = file + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
+    fs.renameSync(tmp, file); // atomic on POSIX
+  }
+
+  loadCollections() { return this.readJSON(this.chronoPath, []); }
+
+  loadCredentials() {
+    return this.readJSON(this.credentialsPath, { trakt: null, radarrServers: [] });
+  }
+
+  loadConfig() {
+    return this.readJSON(this.configPath, {
+      enabled: false,
+      intervalHours: 24,
+      lastSync: null,
+      nextSync: null,
+      autoRadarr: false,
+      radarrServerId: null
+    });
+  }
+
+  loadAudit() { return this.readJSON(this.auditPath, { syncs: [] }); }
+
+  // ═════════════════════════════════════════════
+  // CREDENTIALS (synced from frontend — Trakt token, Radarr servers)
+  // ═════════════════════════════════════════════
+
+  saveCredentials(partial) {
+    const current = this.loadCredentials();
+    const updated = { ...current, ...partial };
+    this.writeJSONAtomic(this.credentialsPath, updated);
+    this.logger.info('🔑 Sync credentials updated (Trakt/Radarr)');
+    return updated;
+  }
+
+  // ═════════════════════════════════════════════
+  // SETTINGS
+  // ═════════════════════════════════════════════
+
+  saveConfig(updates) {
+    const current = this.loadConfig();
+    const updated = { ...current, ...updates };
+    this.writeJSONAtomic(this.configPath, updated);
+    this.restart();
+    return updated;
+  }
+
+  appendAudit(entry) {
+    const audit = this.loadAudit();
+    audit.syncs.unshift(entry); // newest first
+    audit.syncs = audit.syncs.slice(0, 50); // keep last 50 runs
+    this.writeJSONAtomic(this.auditPath, audit);
+  }
+
+  // ═════════════════════════════════════════════
+  // BACKUP (always snapshot before writing changes)
+  // ═════════════════════════════════════════════
+
+  backupCollections() {
+    try {
+      if (!fs.existsSync(this.chronoPath)) return;
+      const backupFile = path.join(this.backupDir, `chrono-collections.${Date.now()}.bak`);
+      fs.copyFileSync(this.chronoPath, backupFile);
+
+      const files = fs.readdirSync(this.backupDir)
+        .filter(f => f.startsWith('chrono-collections.') && f.endsWith('.bak'))
+        .sort();
+      while (files.length > SAFETY_LIMITS.MAX_BACKUPS) {
+        fs.unlinkSync(path.join(this.backupDir, files.shift()));
+      }
+    } catch (e) {
+      this.logger.warn('List sync: backup failed - ' + e.message);
+    }
+  }
+
+  // ═════════════════════════════════════════════
+  // FETCH FROM SOURCE
+  // ═════════════════════════════════════════════
+
+  async fetchTraktList(coll, creds) {
+    if (!creds || !creds.trakt || !creds.trakt.accessToken) {
+      throw new Error('Trakt not connected (connect it in the app first)');
+    }
+
+    const headers = {
+      'Authorization': 'Bearer ' + creds.trakt.accessToken,
+      'Content-Type': 'application/json',
+      'trakt-api-version': '2',
+      'trakt-api-key': creds.trakt.clientId || '',
+      'User-Agent': 'Mozilla/5.0',
+      'Accept': 'application/json'
+    };
+
+    const isWatchlist = coll.sourceListId === 'watchlist';
+    const isOtherUser = coll.sourceUsername
+      && coll.sourceUsername !== 'unknown'
+      && coll.sourceUsername !== creds.trakt.username;
+
+    const buildUrl = (listId) => {
+      if (isWatchlist) return 'https://api.trakt.tv/users/me/watchlist/movies';
+      if (coll.sourceListIsLiked) return `https://api.trakt.tv/lists/${listId}/items/movies`;
+      if (isOtherUser) return `https://api.trakt.tv/users/${encodeURIComponent(coll.sourceUsername)}/lists/${encodeURIComponent(listId)}/items/movies`;
+      return `https://api.trakt.tv/users/me/lists/${listId}/items/movies`;
+    };
+
+    const url = buildUrl(coll.sourceListId);
+
+    try {
+      const response = await axios.get(url, { headers, timeout: 15000 });
+      const items = response.data || [];
+      return items.map(i => (i.movie ? i.movie.title : i.title)).filter(Boolean);
+    } catch (e) {
+      const status = e.response ? e.response.status : '???';
+
+      // Self-heal: "liked" lists are sometimes saved with their slug, but Trakt's
+      // generic /lists/{id} endpoint requires the numeric ID for non-personal lists.
+      // Look the list up by name in the user's liked lists and retry once.
+      if (coll.sourceListIsLiked && status === 400) {
+        this.logger.warn(`Trakt 400 on liked list "${coll.name}" — attempting to resolve the numeric list ID...`);
+        try {
+          const likedRes = await axios.get('https://api.trakt.tv/users/likes/lists', { headers, timeout: 15000 });
+          const likedLists = (likedRes.data || []).map(item => item.list || item);
+          const match = likedLists.find(l =>
+            l.name === (coll.sourceListName || coll.name) ||
+            (l.ids && (l.ids.slug === coll.sourceListId || String(l.ids.trakt) === String(coll.sourceListId)))
+          );
+
+          if (match && match.ids && match.ids.trakt) {
+            const retryRes = await axios.get(buildUrl(match.ids.trakt), { headers, timeout: 15000 });
+            const items = retryRes.data || [];
+
+            // Persist the working numeric ID so future syncs — and the app's own
+            // manual refresh button — stop hitting this bug
+            coll.sourceListId = match.ids.trakt;
+            coll._idHealed = true;
+            this.logger.info(`   ✓ Resolved "${coll.name}" to numeric list ID ${match.ids.trakt} — saved for future syncs`);
+
+            return items.map(i => (i.movie ? i.movie.title : i.title)).filter(Boolean);
+          } else {
+            this.logger.warn(`   Could not find "${coll.name}" in your liked lists — it may have been unliked on Trakt`);
+          }
+        } catch (recoveryError) {
+          this.logger.warn(`   Recovery attempt failed: ${recoveryError.message}`);
+        }
+      }
+
+      const body = e.response ? JSON.stringify(e.response.data).slice(0, 200) : e.message;
+      this.logger.warn(`Trakt fetch failed [${status}] for "${coll.name}" → ${url}`);
+      this.logger.warn(`  Response: ${body}`);
+      throw new Error(`Trakt HTTP ${status}`);
+    }
+  }
+
+  async fetchMDBlistsList(coll) {
+    if (!coll.sourceListApiKey) {
+      throw new Error('No MDBlists API key stored for this collection');
+    }
+
+    const isWatchlist = coll.sourceListId === '_watchlist' || coll.isWatchlist === true;
+
+    try {
+      if (isWatchlist) {
+        const [movies, shows] = await Promise.all([
+          axios.get(`https://api.mdblist.com/watchlist/items/?mediatype=movie&apikey=${coll.sourceListApiKey}`, { timeout: 15000 }),
+          axios.get(`https://api.mdblist.com/watchlist/items/?mediatype=show&apikey=${coll.sourceListApiKey}`, { timeout: 15000 }).catch(() => ({ data: {} }))
+        ]);
+
+        const titles = [];
+        (movies.data.movies || []).forEach(m => m.title && titles.push(m.title));
+        (movies.data.shows || []).forEach(s => s.title && titles.push(s.title));
+        (shows.data.movies || []).forEach(m => m.title && titles.push(m.title));
+        (shows.data.shows || []).forEach(s => s.title && titles.push(s.title));
+        return titles;
+      }
+
+      const url = `https://api.mdblist.com/lists/${coll.sourceListId}/items?apikey=${coll.sourceListApiKey}`;
+      const response = await axios.get(url, { timeout: 15000 });
+      const data = response.data || {};
+
+      const titles = [];
+      (data.movies || []).forEach(m => m.title && titles.push(m.title));
+      (data.shows || []).forEach(s => s.title && titles.push(s.title));
+      (data.episodes || []).forEach(e => e.title && titles.push(e.title));
+      return titles;
+
+    } catch (e) {
+      const status = e.response ? e.response.status : '???';
+      this.logger.warn(`MDBlists fetch failed [${status}] for "${coll.name}" (listId: ${coll.sourceListId})`);
+      throw new Error(`MDBlists HTTP ${status}`);
+    }
+  }
+
+  async fetchLatestTitles(coll, creds) {
+    if (coll.source === 'Trakt') return this.fetchTraktList(coll, creds);
+    if (coll.source === 'MDBlists') return this.fetchMDBlistsList(coll);
+    return null; // e.g. 'import' — no remote source to sync against
+  }
+
+  // ═════════════════════════════════════════════
+  // EMBY LIBRARY SNAPSHOT (one call, reused for every collection)
+  // ═════════════════════════════════════════════
+
+  async fetchLibraryItems() {
+    const url = `${this.embyUrl}/Items?IncludeItemTypes=Movie,Series&Recursive=true&Fields=Id,Name&Limit=10000&UserId=${this.embyUserId}&api_key=${this.embyToken}`;
+    const response = await axios.get(url, { timeout: 20000 });
+    return (response.data && response.data.Items) || [];
+  }
+
+  async fetchCollectionItems(embyId) {
+    const url = `${this.embyUrl}/Items?ParentId=${embyId}&IncludeItemTypes=Movie&Recursive=true&Fields=Id,Name&Limit=2000&UserId=${this.embyUserId}&api_key=${this.embyToken}`;
+    const response = await axios.get(url, { timeout: 15000 });
+    return (response.data && response.data.Items) || [];
+  }
+
+  // Same exact-then-year-stripped matching used by /api/refresh-all-collections
+  matchTitleToLibrary(title, libraryItems) {
+    const exact = libraryItems.find(m => m.Name === title);
+    if (exact) return exact;
+
+    const tClean = title.replace(/\s*\(\d{4}\)\s*$/, '').trim();
+    return libraryItems.find(m => {
+      const movClean = (m.Name || '').replace(/\s*\(\d{4}\)\s*$/, '').trim();
+      return movClean === tClean;
+    }) || null;
+  }
+
+  async addItemsToEmbyCollection(embyId, movieIds) {
+    const url = `${this.embyUrl}/Collections/${embyId}/Items?Ids=${movieIds.join(',')}&api_key=${this.embyToken}`;
+    await axios.post(url, {});
+  }
+
+  // ═════════════════════════════════════════════
+  // SAFETY VALIDATION
+  // ═════════════════════════════════════════════
+
+  validateChanges(oldCount, newCount) {
+    const warnings = [];
+
+    if (oldCount > 0 && newCount === 0) {
+      warnings.push('New list came back empty — skipping update to avoid wiping the collection');
+      return { safe: false, warnings };
+    }
+
+    if (oldCount > 0) {
+      const removedPct = ((oldCount - newCount) / oldCount) * 100;
+      if (removedPct > SAFETY_LIMITS.MAX_PERCENT_REMOVED) {
+        warnings.push(`${removedPct.toFixed(0)}% of items would be removed — check the source list`);
+      }
+    }
+
+    return { safe: true, warnings };
+  }
+
+  // ═════════════════════════════════════════════
+  // RADARR (mirrors the frontend's sendToRadarrSilent)
+  // ═════════════════════════════════════════════
+
+  async sendToRadarr(title, radarrServer) {
+    try {
+      const base = radarrServer.url.replace(/\/$/, '');
+      const headers = { 'X-Api-Key': radarrServer.apiKey };
+
+      const lookupRes = await axios.get(`${base}/api/v3/movie/lookup`, {
+        headers, params: { term: title }, timeout: 10000
+      });
+      const results = lookupRes.data || [];
+      if (!results.length) return { status: 'not_found', title };
+
+      const [rfRes, qpRes] = await Promise.all([
+        axios.get(`${base}/api/v3/rootfolder`, { headers, timeout: 10000 }).catch(() => ({ data: [] })),
+        axios.get(`${base}/api/v3/qualityprofile`, { headers, timeout: 10000 }).catch(() => ({ data: [] }))
+      ]);
+
+      const rootPath = (rfRes.data[0] && rfRes.data[0].path) || '/movies';
+      const qualityId = (qpRes.data[0] && qpRes.data[0].id) || 1;
+      const movie = results[0];
+
+      const payload = {
+        title: movie.title,
+        qualityProfileId: qualityId,
+        titleSlug: movie.titleSlug,
+        images: movie.images || [],
+        tmdbId: movie.tmdbId,
+        year: movie.year,
+        rootFolderPath: rootPath,
+        monitored: true,
+        addOptions: { searchForMovie: true }
+      };
+
+      const addRes = await axios.post(`${base}/api/v3/movie`, payload, {
+        headers: { ...headers, 'Content-Type': 'application/json' },
+        timeout: 15000,
+        validateStatus: () => true
+      });
+
+      if (addRes.status === 201 || addRes.status === 200) return { status: 'sent', title };
+      if (addRes.status === 400) return { status: 'already_exists', title };
+      return { status: 'failed', title, error: `HTTP ${addRes.status}` };
+
+    } catch (e) {
+      return { status: 'failed', title, error: e.message };
+    }
+  }
+
+  // ═════════════════════════════════════════════
+  // PER-COLLECTION SYNC
+  // ═════════════════════════════════════════════
+
+  async syncCollection(coll, creds, libraryItems, options) {
+    const result = {
+      id: coll.embyId,
+      name: coll.name,
+      source: coll.source,
+      changed: false,
+      idHealed: false,
+      skipped: false,
+      error: null,
+      warnings: [],
+      added: [],
+      removed: [],
+      missingFromLibrary: [],
+      addedToEmby: [],
+      radarrQueued: []
+    };
+
+    try {
+      const newTitles = await this.fetchLatestTitles(coll, creds);
+
+      if (coll._idHealed) {
+        result.idHealed = true;
+        delete coll._idHealed;
+      }
+
+      if (newTitles === null) {
+        result.skipped = true;
+        return result;
+      }
+
+      const uniqueNew = Array.from(new Set(newTitles.filter(Boolean)));
+      const oldTitles = coll.importedTitles || coll.originalTitles || [];
+
+      const validation = this.validateChanges(oldTitles.length, uniqueNew.length);
+      result.warnings = validation.warnings;
+      if (!validation.safe) {
+        result.error = validation.warnings.join('; ');
+        return result;
+      }
+
+      const oldSet = new Set(oldTitles);
+      const newSet = new Set(uniqueNew);
+
+      result.added = uniqueNew.filter(t => !oldSet.has(t));
+      result.removed = oldTitles.filter(t => !newSet.has(t));
+      result.changed = result.added.length > 0 || result.removed.length > 0;
+
+      // Find any title in the latest list that's matchable in the library but
+      // not yet in the actual Emby collection — then add it, same as the
+      // import flow and /api/refresh-all-collections do.
+      if (!options.dryRun) {
+        let currentItems = [];
+        try {
+          currentItems = await this.fetchCollectionItems(coll.embyId);
+        } catch (e) {
+          this.logger.warn(`   Could not read current Emby items for "${coll.name}": ${e.message}`);
+        }
+        const currentIds = new Set(currentItems.map(m => m.Id));
+        const currentNames = new Set(currentItems.map(m => m.Name));
+
+        const toAdd = [];
+        const stillMissing = [];
+
+        for (const title of uniqueNew) {
+          if (currentNames.has(title)) continue; // already in the Emby collection
+
+          const match = this.matchTitleToLibrary(title, libraryItems);
+          if (match && !currentIds.has(match.Id)) {
+            toAdd.push(match);
+          } else if (!match) {
+            stillMissing.push(title);
+          }
+        }
+
+        if (toAdd.length > 0) {
+          try {
+            await this.addItemsToEmbyCollection(coll.embyId, toAdd.map(m => m.Id));
+            result.addedToEmby = toAdd.map(m => m.Name);
+            result.changed = true;
+          } catch (e) {
+            this.logger.warn(`   Failed to add items to Emby collection "${coll.name}": ${e.message}`);
+          }
+        }
+
+        result.missingFromLibrary = stillMissing;
+
+        // Persist the full picture onto the collection record itself —
+        // embyId stays the consistent key the rest of the app already uses
+        coll.importedTitles = uniqueNew;
+        coll.originalTitles = uniqueNew;
+        coll.missingTitles = stillMissing;
+        coll.lastSourceFetch = new Date().toISOString();
+      } else {
+        // Dry run — just report what's missing against the library snapshot
+        const libNames = new Set(libraryItems.map(m => m.Name));
+        result.missingFromLibrary = uniqueNew.filter(t => !libNames.has(t));
+      }
+
+      // Send everything still missing to Radarr if this collection has it enabled,
+      // OR if the global "auto-send all list updates" setting is on
+      // (mirrors the existing manual-refresh behaviour — Radarr no-ops on dupes)
+      const radarrEnabled = !!coll.radarrAutoSend || !!options.globalRadarr;
+      if (!options.dryRun && radarrEnabled && result.missingFromLibrary.length > 0) {
+        const serverId = (coll.radarrAutoSend && coll.radarrServerId !== undefined && coll.radarrServerId !== null)
+          ? coll.radarrServerId
+          : options.globalRadarrServerId;
+        const server = creds.radarrServers && creds.radarrServers[serverId];
+        if (server && server.url && server.apiKey) {
+          for (const title of result.missingFromLibrary) {
+            const sent = await this.sendToRadarr(title, server);
+            if (sent.status === 'sent') result.radarrQueued.push(title);
+          }
+        }
+      }
+
+    } catch (e) {
+      result.error = e.message;
+      this.logger.warn(`List sync: "${coll.name}" failed - ${e.message}`);
+    }
+
+    return result;
+  }
+
+  // ═════════════════════════════════════════════
+  // FULL SYNC (all Trakt/MDBlists collections)
+  // ═════════════════════════════════════════════
+
+  async syncAll(options = {}) {
+    if (this.isSyncing) {
+      return { success: false, error: 'A sync is already running' };
+    }
+    this.isSyncing = true;
+
+    const startTime = Date.now();
+    const dryRun = !!options.dryRun;
+
+    const summary = {
+      timestamp: new Date().toISOString(),
+      dryRun,
+      success: false,
+      collectionsChecked: 0,
+      collectionsChanged: 0,
+      collectionsSkipped: 0,
+      collectionsFailed: 0,
+      totalAdded: 0,
+      totalRemoved: 0,
+      totalAddedToEmby: 0,
+      totalRadarrQueued: 0,
+      collections: [],
+      errors: []
+    };
+
+    try {
+      const collections = this.loadCollections();
+      const creds = this.loadCredentials();
+      const config = this.loadConfig();
+      const syncable = collections.filter(c => c.source === 'Trakt' || c.source === 'MDBlists');
+
+      if (syncable.length === 0) {
+        summary.success = true;
+        summary.message = 'No Trakt/MDBlists collections to sync';
+        return summary;
+      }
+
+      this.logger.info(`🔄 [LIST SYNC] Checking ${syncable.length} list(s) for updates${dryRun ? ' (dry run)' : ''}...`);
+
+      let libraryItems = [];
+      try {
+        libraryItems = await this.fetchLibraryItems();
+      } catch (e) {
+        this.logger.warn('List sync: could not fetch Emby library - ' + e.message);
+      }
+
+      if (!dryRun) this.backupCollections();
+
+      let anyIdHealed = false;
+      let anyProcessed = false;
+
+      for (const coll of syncable) {
+        summary.collectionsChecked++;
+        const result = await this.syncCollection(coll, creds, libraryItems, {
+          dryRun,
+          globalRadarr: !!config.autoRadarr,
+          globalRadarrServerId: config.radarrServerId
+        });
+
+        if (result.idHealed) anyIdHealed = true;
+
+        if (result.skipped) {
+          summary.collectionsSkipped++;
+          this.logger.info(`   • ${coll.name} (${coll.source}): skipped — not a syncable source`);
+          continue;
+        }
+
+        if (result.error) {
+          summary.collectionsFailed++;
+          summary.errors.push({ name: coll.name, error: result.error });
+          this.logger.warn(`   • ${coll.name} (${coll.source}): FAILED — ${result.error}`);
+          continue;
+        }
+
+        anyProcessed = true;
+        this.logger.info(`   • ${coll.name} (${coll.source}): +${result.added.length} / -${result.removed.length}${result.addedToEmby.length ? `, ${result.addedToEmby.length} added to Emby collection` : ''}${result.missingFromLibrary.length ? `, ${result.missingFromLibrary.length} missing from library` : ''}`);
+
+        if (result.changed) {
+          summary.collectionsChanged++;
+          summary.totalAdded += result.added.length;
+          summary.totalRemoved += result.removed.length;
+        }
+        summary.totalAddedToEmby += result.addedToEmby.length;
+        summary.totalRadarrQueued += result.radarrQueued.length;
+
+        if (result.changed || result.radarrQueued.length > 0 || result.idHealed) {
+          summary.collections.push({
+            id: result.id,
+            name: result.name,
+            source: result.source,
+            added: result.added,
+            removed: result.removed,
+            addedToEmby: result.addedToEmby,
+            missingFromLibrary: result.missingFromLibrary,
+            radarrQueued: result.radarrQueued,
+            idHealed: result.idHealed
+          });
+        }
+      }
+
+      // Always persist after a real (non-dry-run) pass — missingTitles/originalTitles
+      // get refreshed on every collection regardless of whether the title-diff
+      // itself changed, so the file needs to stay in step every run.
+      if (!dryRun && anyProcessed) {
+        this.writeJSONAtomic(this.chronoPath, collections);
+      }
+
+      if (summary.collectionsChanged > 0 || summary.totalAddedToEmby > 0) {
+        this.logger.info(`✅ [LIST SYNC] ${summary.collectionsChanged} list(s) updated — +${summary.totalAdded} / -${summary.totalRemoved}${summary.totalAddedToEmby ? `, ${summary.totalAddedToEmby} added to Emby` : ''}${summary.totalRadarrQueued ? `, ${summary.totalRadarrQueued} sent to Radarr` : ''}`);
+      } else {
+        this.logger.info(`✅ [LIST SYNC] Complete — no changes detected`);
+      }
+
+      summary.durationMs = Date.now() - startTime;
+      summary.success = true;
+
+      if (!dryRun) {
+        this.appendAudit(summary);
+        const config = this.loadConfig();
+        config.lastSync = summary.timestamp;
+        config.nextSync = config.enabled
+          ? new Date(Date.now() + config.intervalHours * 60 * 60 * 1000).toISOString()
+          : null;
+        this.writeJSONAtomic(this.configPath, config);
+      }
+
+      return summary;
+
+    } catch (error) {
+      this.logger.error('List sync failed', error);
+      summary.error = error.message;
+      return summary;
+    } finally {
+      this.isSyncing = false;
+    }
+  }
+
+  // ═════════════════════════════════════════════
+  // SCHEDULING (simple interval timer, no cron needed)
+  // ═════════════════════════════════════════════
+
+  start() {
+    const config = this.loadConfig();
+    if (config.enabled) {
+      this.scheduleNext(config.intervalHours);
+      this.logger.info(`List sync scheduler started (every ${config.intervalHours}h)`);
+    }
+  }
+
+  scheduleNext(intervalHours) {
+    if (this.timer) clearTimeout(this.timer);
+    const ms = Math.max(1, intervalHours) * 60 * 60 * 1000;
+    this.timer = setTimeout(async () => {
+      await this.syncAll({ dryRun: false });
+      const config = this.loadConfig();
+      if (config.enabled) this.scheduleNext(config.intervalHours);
+    }, ms);
+  }
+
+  restart() {
+    if (this.timer) { clearTimeout(this.timer); this.timer = null; }
+    this.start();
+  }
+
+  // ═════════════════════════════════════════════
+  // STATUS
+  // ═════════════════════════════════════════════
+
+  getStatus() {
+    const config = this.loadConfig();
+    const audit = this.loadAudit();
+    return {
+      ...config,
+      isSyncing: this.isSyncing,
+      lastResult: audit.syncs[0] || null,
+      history: audit.syncs.slice(0, 10)
+    };
+  }
+}
+
+module.exports = ListSyncService;

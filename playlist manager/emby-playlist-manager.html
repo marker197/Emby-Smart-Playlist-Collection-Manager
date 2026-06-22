@@ -2565,6 +2565,44 @@ canvas {
       <hr style="margin:14px 0;border:none;border-top:1px solid var(--border);">
 
       <div class="settings-section-title">
+        <svg width="11" height="11" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 11-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/></svg>
+        List Auto-Sync (Trakt / MDBlists)
+      </div>
+      <p style="font-size:11px;color:var(--text3);margin:-4px 0 10px;">Checks your imported lists for changes and updates them automatically — even with the app closed.</p>
+      <label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;cursor:pointer;font-size:13px;">
+        <input type="checkbox" id="listSyncEnabled" onchange="saveSyncSettings()">
+        <span>Enable auto-sync</span>
+      </label>
+      <div class="field" style="margin-bottom:10px;">
+        <label style="font-size:11px;">Check every</label>
+        <select id="listSyncInterval" onchange="saveSyncSettings()" style="font-size:13px;">
+          <option value="1">1 hour</option>
+          <option value="6">6 hours</option>
+          <option value="12">12 hours</option>
+          <option value="24" selected>24 hours</option>
+          <option value="168">Weekly</option>
+        </select>
+      </div>
+      <p style="font-size:11px;color:var(--text3);margin:0 0 10px;">This auto-sends every still-missing item, every run — and you can also enable it for one specific list in the Collections tab instead.</p>
+      <label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;cursor:pointer;font-size:13px;">
+        <input type="checkbox" id="syncAutoRadarr" onchange="saveSyncSettings()">
+        <span>Auto-send all list updates to Radarr</span>
+      </label>
+      <div class="field" id="syncRadarrServerField" style="margin-bottom:10px;display:none;">
+        <label style="font-size:11px;">Radarr Server</label>
+        <select id="syncRadarrServerId" onchange="saveSyncSettings()" style="font-size:13px;">
+          <option value="">— select a server —</option>
+        </select>
+      </div>
+      <button class="btn btn-secondary btn-sm" id="btnSyncListsNow" onclick="triggerListSyncNow()" style="width:100%;font-size:12px;">
+        <svg width="12" height="12" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 11-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/></svg>
+        Sync Lists Now
+      </button>
+      <div id="listSyncStatus" style="font-size:11px;color:var(--text3);margin-top:8px;line-height:1.6;"></div>
+
+      <hr style="margin:14px 0;border:none;border-top:1px solid var(--border);">
+
+      <div class="settings-section-title">
         <svg width="11" height="11" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><path d="M12 1v6M12 17v6M4.22 4.22l4.24 4.24M15.54 15.54l4.24 4.24M1 12h6M17 12h6M4.22 19.78l4.24-4.24M15.54 8.46l4.24-4.24"/></svg>
         Theme
       </div>
@@ -3388,6 +3426,7 @@ function openSettings(){
     }
   });
   refreshCollectionsDashboard(); // Refresh collections dashboard
+  loadSyncStatusUI();
   el('settingsModal').classList.add('open');
 }
 function closeSettings(){ el('settingsModal').classList.remove('open'); }
@@ -4614,6 +4653,54 @@ async function syncChronoCollectionsToBackend() {
   } catch (e) {
     console.warn('Chrono sync error:', e.message);
   }
+}
+
+/* ── Push Trakt token + Radarr servers to backend so list-sync can run without the browser open ── */
+/* ── Pull the backend's current missing-title lists into the local cache ──
+   Needed because background syncs (browser closed) update chrono-collections.json
+   directly but can't touch localStorage themselves ── */
+async function syncMissingListsFromBackend(){
+  try{
+    var r = await fetch('/api/chrono/missing-lists');
+    if(!r.ok) return;
+    var data = await r.json();
+    if(!data.success || !data.lists) return;
+
+    Object.keys(data.lists).forEach(function(embyId){
+      saveMissingMoviesForCollection(embyId, data.lists[embyId] || []);
+    });
+  }catch(e){
+    console.warn('Could not sync missing lists from backend:', e.message);
+  }
+}
+
+async function syncCredentialsToBackend(){
+  try{
+    var payload = {
+      trakt: S.traktAccessToken ? {
+        accessToken: S.traktAccessToken,
+        username: S.traktUsername || '',
+        clientId: ''
+      } : null,
+      radarrServers: (S.radarrServers || []).map(function(s){ return { name: s.name, url: s.url, apiKey: s.apiKey }; })
+    };
+
+    // Resolve decrypted client id (stored encrypted) for the trakt-api-key header
+    if(payload.trakt){
+      try {
+        var cid = localStorage.getItem('cp_trakt_client_id') || '';
+        payload.trakt.clientId = cid ? await secureDecrypt(cid) : '';
+      } catch(e){ payload.trakt.clientId = ''; }
+    }
+
+    await fetch('/api/credentials/sync', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+  } catch(e){
+    console.warn('Credential sync error:', e.message);
+  }
 }function apiPost(path,body){pingNet('emby');return fetch(S.serverUrl+path,{method:'POST',headers:embyH(),body:body!=null?JSON.stringify(body):undefined}).then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);var ct=r.headers.get('content-type')||'';return ct.indexOf('json')!==-1?r.json():null;});}
 
 /* Network activity highlighter — pulses the matching panel row briefly */
@@ -4768,6 +4855,7 @@ async function saveRadarr(){
     });
   }
   localStorage.setItem('cp_radarr', JSON.stringify(toStore));
+  syncCredentialsToBackend();
 }
 async function loadRadarrFromStorage(){
   try{
@@ -5002,6 +5090,166 @@ async function autoRefreshOnLoad(){
   }
 }
 
+/* ── List Auto-Sync (Trakt/MDBlists) — Settings panel ── */
+async function loadSyncStatusUI(){
+  try{
+    loadSavedCollections();
+
+    var r = await fetch('/api/sync-status');
+    if(!r.ok) return;
+    var s = await r.json();
+
+    var enabledEl = el('listSyncEnabled');
+    var intervalEl = el('listSyncInterval');
+    if(enabledEl) enabledEl.checked = !!s.enabled;
+    if(intervalEl) intervalEl.value = String(s.intervalHours || 24);
+
+    // Populate the global Radarr server dropdown from the radarr servers we already have
+    var serverSel = el('syncRadarrServerId');
+    if(serverSel){
+      serverSel.innerHTML = '<option value="">— select a server —</option>';
+      (S.radarrServers || []).forEach(function(srv, idx){
+        var opt = document.createElement('option');
+        opt.value = idx;
+        opt.textContent = srv.name || ('Server '+idx);
+        if(s.radarrServerId === idx) opt.selected = true;
+        serverSel.appendChild(opt);
+      });
+    }
+
+    var autoRadarrEl = el('syncAutoRadarr');
+    if(autoRadarrEl) autoRadarrEl.checked = !!s.autoRadarr;
+    var serverField = el('syncRadarrServerField');
+    if(serverField) serverField.style.display = s.autoRadarr ? 'block' : 'none';
+
+    renderSyncStatus(s);
+  }catch(e){
+    console.warn('Could not load sync status:', e.message);
+  }
+}
+
+function renderSyncStatus(s){
+  var box = el('listSyncStatus');
+  if(!box) return;
+
+  var lines = [];
+  if(s.lastSync){
+    lines.push('Last checked: '+formatTimeAgo(new Date(s.lastSync)));
+  } else {
+    lines.push('Never run yet');
+  }
+  if(s.enabled && s.nextSync){
+    lines.push('Next check: '+formatTimeAgo(new Date(s.nextSync)));
+  }
+
+  var last = s.lastResult;
+  if(last){
+    if(last.totalAdded || last.totalRemoved){
+      lines.push('Last result: +'+(last.totalAdded||0)+' / -'+(last.totalRemoved||0)+(last.totalRadarrQueued?', '+last.totalRadarrQueued+' sent to Radarr':''));
+    } else {
+      lines.push('Last result: no changes');
+    }
+    if(last.collectionsFailed){
+      lines.push('<span style="color:var(--danger);">'+last.collectionsFailed+' list(s) failed to check</span>');
+    }
+  }
+
+  // Radarr summary — combine the global "all lists" switch with any per-collection ones
+  if(s.autoRadarr){
+    var srv = (S.radarrServers && S.radarrServers[s.radarrServerId]) ? S.radarrServers[s.radarrServerId].name : 'no server selected';
+    lines.push('Radarr auto-send: <b>ON for all list updates</b> ('+esc(srv)+')');
+  } else {
+    var radarrOn = (S_savedCollections || []).filter(function(c){
+      return (c.source === 'Trakt' || c.source === 'MDBlists') && c.radarrAutoSend;
+    });
+    console.log('[renderSyncStatus] radarrAutoSend per collection:', (S_savedCollections||[]).map(function(c){return {name:c.name, source:c.source, radarrAutoSend:c.radarrAutoSend};}));
+    if(radarrOn.length){
+      lines.push('Radarr auto-send on for: '+radarrOn.map(function(c){return esc(c.name);}).join(', '));
+    } else {
+      lines.push('<span style="color:var(--text3);">Radarr auto-send is off — enable it above for all lists, or per-list in the Collections tab.</span>');
+    }
+  }
+
+  box.innerHTML = lines.join('<br>');
+}
+
+async function saveSyncSettings(){
+  try{
+    var enabled = el('listSyncEnabled') ? el('listSyncEnabled').checked : false;
+    var intervalHours = parseInt(el('listSyncInterval') ? el('listSyncInterval').value : 24, 10);
+    var autoRadarr = el('syncAutoRadarr') ? el('syncAutoRadarr').checked : false;
+    var serverField = el('syncRadarrServerField');
+    if(serverField) serverField.style.display = autoRadarr ? 'block' : 'none';
+
+    var serverVal = el('syncRadarrServerId') ? el('syncRadarrServerId').value : '';
+    var radarrServerId = serverVal === '' ? null : parseInt(serverVal, 10);
+
+    if(autoRadarr && radarrServerId === null){
+      toast('Select a Radarr server to enable auto-send', 'warn', 3000);
+    }
+
+    var r = await fetch('/api/sync-settings', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ enabled: enabled, intervalHours: intervalHours, autoRadarr: autoRadarr, radarrServerId: radarrServerId })
+    });
+    if(r.ok){
+      toast(enabled ? '✓ Auto-sync enabled — checking every '+intervalHours+'h' : 'Auto-sync disabled', 'ok', 2500);
+      loadSyncStatusUI();
+    }
+  }catch(e){
+    toast('Could not save sync settings: '+e.message, 'err');
+  }
+}
+
+async function triggerListSyncNow(){
+  var btn = el('btnSyncListsNow');
+  var originalHtml = btn ? btn.innerHTML : '';
+  if(btn){ btn.disabled = true; btn.innerHTML = SPIN+' Checking lists…'; }
+
+  try{
+    var r = await fetch('/api/sync-lists', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ dryRun: false })
+    });
+    var result = await r.json();
+
+    if(!result.success){
+      toast('Sync failed: '+(result.error||'Unknown error'), 'err');
+    } else if(result.collectionsChanged > 0 || result.totalAddedToEmby > 0){
+      var lines = [];
+      (result.collections||[]).forEach(function(c){
+        var parts = [];
+        if(c.added && c.added.length) parts.push(c.added.length+' Item'+(c.added.length!==1?'s':'')+' Added');
+        if(c.removed && c.removed.length) parts.push(c.removed.length+' Item'+(c.removed.length!==1?'s':'')+' Removed');
+        if(parts.length) lines.push('<b>'+esc(c.name)+'</b>: '+parts.join(', '));
+      });
+      toast(lines.length ? lines.join('<br>') : '✓ Lists updated', 'ok', Math.max(3500, lines.length*1500));
+
+      // Pull the freshly-updated missing lists down and refresh visible counts
+      await syncMissingListsFromBackend();
+      refreshCollectionCounts();
+    } else {
+      toast('✓ Checked '+result.collectionsChecked+' list(s) — no changes', 'inf', 3000);
+    }
+
+    if(result.errors && result.errors.length){
+      toast('⚠️ '+result.errors.length+' list(s) failed — check terminal logs', 'warn', 4000);
+    }
+
+    renderSyncStatus(result.totalAdded !== undefined ? {
+      lastSync: result.timestamp, nextSync: null, lastResult: result, enabled: el('listSyncEnabled') && el('listSyncEnabled').checked
+    } : result);
+    loadSyncStatusUI();
+
+  }catch(e){
+    toast('Sync request failed: '+e.message, 'err');
+  } finally {
+    if(btn){ btn.disabled = false; btn.innerHTML = originalHtml; }
+  }
+}
+
 async function doLogin(){
   var url=(el('serverUrl').value||'').trim().replace(/\/$/,'');
   var user=(el('username').value||'').trim();
@@ -5084,6 +5332,8 @@ async function doLogin(){
     await loadFanartTvProjectKey();
     await loadFanartTvKey();
     await loadTraktAccessToken();
+    syncCredentialsToBackend();
+    syncMissingListsFromBackend();
     // Pre-load collections in background so the dropdown is ready when needed
     loadCollections();
     autoRefreshOnLoad(); // Auto-refresh if enabled
@@ -7238,6 +7488,7 @@ async function exchangeTraktPin(){
     updateTraktLoginUI();
     renderNetworkList();
     toast('Trakt connected as <b>'+esc(S.traktUsername)+'</b>.','ok');
+    syncCredentialsToBackend();
   } catch(e){
     if(status){ status.style.color='var(--danger)'; status.textContent='Failed: '+e.message; }
     toast('Trakt auth failed: '+e.message,'err');
@@ -9912,13 +10163,19 @@ async function refreshCollectionsDashboard(){
   html += '<select id="collectionSelect" onchange="showCollectionDetailsView(this.value)" style="width:100%;padding:8px;border-radius:var(--radius);border:1px solid var(--border);background:var(--surface2);color:var(--text);font-size:13px;">';
   html += '<option value="">-- Choose a collection --</option>';
   
+  var shownCount = 0;
   S_savedCollections.forEach(function(coll, idx){
+    if(coll.source === 'emby') return; // native Emby BoxSets aren't app-managed lists — skip them here
     var source = coll.source || 'Custom';
     html += '<option value="'+idx+'">'+esc(coll.name)+' ('+source+')</option>';
+    shownCount++;
   });
   
   html += '</select>';
   html += '</div>';
+  if(shownCount === 0){
+    html += '<div style="text-align:center;color:var(--text3);padding:20px;font-size:12px;">No Trakt, MDBlists, or Smart collections yet — native Emby collections aren\'t shown here.</div>';
+  }
   html += '<div id="collectionDetailsView"></div>';
   
   dashboard.innerHTML = html;
@@ -10553,6 +10810,8 @@ function toggleRadarrSend(collIndex){
   var checkbox = el('radarrSend_'+collIndex);
   coll.radarrAutoSend = checkbox.checked;
   try { localStorage.setItem('cp_saved_collections', JSON.stringify(S_savedCollections)); } catch(e){}
+  syncChronoCollectionsToBackend();
+  loadSyncStatusUI();
   showCollectionDetails(coll.embyId, collIndex);
   toast(checkbox.checked ? 'Radarr auto-send enabled' : 'Radarr auto-send disabled', 'ok');
 }
@@ -10571,6 +10830,8 @@ function setRadarrServer(collIndex){
   }
   
   try { localStorage.setItem('cp_saved_collections', JSON.stringify(S_savedCollections)); } catch(e){}
+  syncChronoCollectionsToBackend();
+  loadSyncStatusUI();
 }
 
 function getNextRefreshTime(lastRefresh, interval){
