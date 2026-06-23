@@ -26,6 +26,7 @@ class ListSyncService {
     this.configPath = path.join(this.dataDir, 'sync-config.json');
     this.auditPath = path.join(this.dataDir, 'sync-audit.json');
     this.watchedStatePath = path.join(this.dataDir, 'watched-sync-state.json');
+    this.publishStatePath = path.join(this.dataDir, 'smart-publish-state.json');
     this.backupDir = path.join(this.dataDir, 'backups');
 
     if (!fs.existsSync(this.backupDir)) {
@@ -61,7 +62,7 @@ class ListSyncService {
   loadCollections() { return this.readJSON(this.chronoPath, []); }
 
   loadCredentials() {
-    return this.readJSON(this.credentialsPath, { trakt: null, radarrServers: [] });
+    return this.readJSON(this.credentialsPath, { trakt: null, radarrServers: [], mdblistApiKey: null });
   }
 
   loadConfig() {
@@ -85,6 +86,15 @@ class ListSyncService {
 
   saveWatchedState(state) {
     this.writeJSONAtomic(this.watchedStatePath, state);
+  }
+
+  loadPublishState() {
+    return this.readJSON(this.publishStatePath, {});
+    // shape: { [scheduleId]: { trakt: { listId, pushedIds: [...] }, mdblist: { listId, pushedIds: [...] } } }
+  }
+
+  savePublishState(state) {
+    this.writeJSONAtomic(this.publishStatePath, state);
   }
 
   // ═════════════════════════════════════════════
@@ -114,7 +124,7 @@ class ListSyncService {
   appendAudit(entry) {
     const audit = this.loadAudit();
     audit.syncs.unshift(entry); // newest first
-    audit.syncs = audit.syncs.slice(0, 50); // keep last 50 runs
+    audit.syncs = audit.syncs.slice(0, 500); // keep last 500 runs — enough for a meaningful timeline
     this.writeJSONAtomic(this.auditPath, audit);
   }
 
@@ -629,6 +639,317 @@ class ListSyncService {
     }
 
     this.saveWatchedState(watchedState);
+    return result;
+  }
+
+  // ═════════════════════════════════════════════
+  // SMART LIST PUBLISHING (Emby Smart Collection → Trakt / MDBlists)
+  // Publishes a locally-built Smart Collection out as a real list on each
+  // service, then keeps it in sync as the rule's matched items change.
+  // ═════════════════════════════════════════════
+
+  // Cheap existence checks — used to detect a list that was deleted externally,
+  // since trusting a stored listId/pushedKeys forever would otherwise mean a
+  // deleted list is never recreated (an empty diff never even attempts an API call).
+  async traktListExists(listId, creds) {
+    try {
+      const headers = {
+        'Authorization': 'Bearer ' + creds.trakt.accessToken,
+        'trakt-api-version': '2',
+        'trakt-api-key': creds.trakt.clientId || ''
+      };
+      await axios.get(`https://api.trakt.tv/users/me/lists/${listId}`, { headers, timeout: 10000 });
+      return true;
+    } catch (e) {
+      if (e.response && e.response.status === 404) return false;
+      throw e; // network/auth errors shouldn't be treated as "list doesn't exist"
+    }
+  }
+
+  async mdblistExists(listId, apiKey) {
+    try {
+      await axios.get(`https://api.mdblist.com/lists/${listId}/items?apikey=${apiKey}`, { timeout: 10000 });
+      return true;
+    } catch (e) {
+      if (e.response && e.response.status === 404) return false;
+      throw e;
+    }
+  }
+
+  async createTraktList(name, description, creds) {
+    const headers = {
+      'Authorization': 'Bearer ' + creds.trakt.accessToken,
+      'Content-Type': 'application/json',
+      'trakt-api-version': '2',
+      'trakt-api-key': creds.trakt.clientId || ''
+    };
+    const response = await axios.post('https://api.trakt.tv/users/me/lists', {
+      name, description: description || '', privacy: 'private'
+    }, { headers, timeout: 15000 });
+
+    return response.data; // includes ids.trakt, ids.slug
+  }
+
+  async addItemsToTraktList(listId, movies, creds) {
+    const headers = {
+      'Authorization': 'Bearer ' + creds.trakt.accessToken,
+      'Content-Type': 'application/json',
+      'trakt-api-version': '2',
+      'trakt-api-key': creds.trakt.clientId || ''
+    };
+    const response = await axios.post(`https://api.trakt.tv/users/me/lists/${listId}/items`, {
+      movies: movies.map(m => ({ ids: m.imdb ? { imdb: m.imdb } : { tmdb: parseInt(m.tmdb, 10) } }))
+    }, { headers, timeout: 15000 });
+
+    return response.data; // {added:{movies}, existing:{movies}, not_found:{movies:[]}}
+  }
+
+  async removeItemsFromTraktList(listId, movies, creds) {
+    const headers = {
+      'Authorization': 'Bearer ' + creds.trakt.accessToken,
+      'Content-Type': 'application/json',
+      'trakt-api-version': '2',
+      'trakt-api-key': creds.trakt.clientId || ''
+    };
+    const response = await axios.post(`https://api.trakt.tv/users/me/lists/${listId}/items/remove`, {
+      movies: movies.map(m => ({ ids: m.imdb ? { imdb: m.imdb } : { tmdb: parseInt(m.tmdb, 10) } }))
+    }, { headers, timeout: 15000 });
+
+    return response.data;
+  }
+
+  async createMDBList(name, apiKey) {
+    const response = await axios.post(
+      `https://api.mdblist.com/lists/user/add?apikey=${apiKey}`,
+      { name, private: true },
+      { headers: { 'Content-Type': 'application/json' }, timeout: 15000 }
+    );
+    return response.data; // {id, slug, url}
+  }
+
+  async addItemsToMDBList(listId, movies, apiKey) {
+    // Flat shape confirmed working: {tmdb, imdb} directly on each item, no ids{} wrapper
+    const response = await axios.post(
+      `https://api.mdblist.com/lists/${listId}/items/add?apikey=${apiKey}`,
+      { movies: movies.map(m => ({ tmdb: m.tmdb ? parseInt(m.tmdb, 10) : undefined, imdb: m.imdb || undefined })) },
+      { headers: { 'Content-Type': 'application/json' }, timeout: 15000 }
+    );
+    return response.data; // {added:{movies}, existing:{movies}, not_found:{movies}}
+  }
+
+  async removeItemsFromMDBList(listId, movies, apiKey) {
+    // Mirrors addItemsToMDBList's confirmed-working flat shape — unconfirmed for remove
+    // specifically, so callers should treat a surprising not_found count as suspect
+    // rather than assume the removal genuinely failed.
+    const response = await axios.post(
+      `https://api.mdblist.com/lists/${listId}/items/remove?apikey=${apiKey}`,
+      { movies: movies.map(m => ({ tmdb: m.tmdb ? parseInt(m.tmdb, 10) : undefined, imdb: m.imdb || undefined })) },
+      { headers: { 'Content-Type': 'application/json' }, timeout: 15000 }
+    );
+    return response.data;
+  }
+
+  // Orchestrator — called every time a Smart Collection's schedule runs (manual or cron).
+  // items: the CURRENT full set of rule-matched movies, as {name, imdb, tmdb}.
+  async publishSmartList(schedule, items, options = {}) {
+    const dryRun = !!options.dryRun;
+    const creds = this.loadCredentials();
+    const publishState = this.loadPublishState();
+    const scheduleId = schedule.id;
+
+    if (!publishState[scheduleId]) {
+      publishState[scheduleId] = { trakt: { listId: schedule.traktListId || null, listUrl: schedule.traktListUrl || null, pushedKeys: [] }, mdblist: { listId: schedule.mdblistListId || null, listUrl: schedule.mdblistListUrl || null, pushedKeys: [] } };
+    }
+    const state = publishState[scheduleId];
+    if (schedule.traktListId && !state.trakt.listId) state.trakt.listId = schedule.traktListId;
+    if (schedule.mdblistListId && !state.mdblist.listId) state.mdblist.listId = schedule.mdblistListId;
+
+    const currentKeys = new Set(items.map(i => i.imdb || String(i.tmdb)));
+    const itemsByKey = new Map(items.map(i => [i.imdb || String(i.tmdb), i]));
+
+    const result = { traktListId: null, traktListUrl: null, traktAdded: 0, traktRemoved: 0, mdblistListId: null, mdblistListUrl: null, mdblistAdded: 0, mdblistRemoved: 0, errors: [] };
+
+    // ---- Trakt ----
+    if (schedule.publishToTrakt) {
+      try {
+        // Verify a previously-created list still actually exists. Without this,
+        // a deleted list sits forever with an empty diff (everything already in
+        // pushedKeys), so we'd never even attempt an API call that could reveal
+        // it's gone — silently doing nothing instead of recreating it.
+        let traktListId = state.trakt.listId;
+        let traktListUrl = state.trakt.listUrl;
+        let traktPushedKeys = state.trakt.pushedKeys;
+
+        if (traktListId) {
+          const exists = await this.traktListExists(traktListId, creds);
+          if (!exists) {
+            this.logger.warn(`   Trakt list ${traktListId} no longer exists (deleted externally?) — will recreate`);
+            traktListId = null;
+            traktListUrl = null;
+            traktPushedKeys = [];
+          }
+        }
+
+        if (!traktListId) {
+          if (dryRun) {
+            result.traktListId = 'would-create';
+          } else {
+            const created = await this.createTraktList(schedule.playlistName, schedule.description, creds);
+            traktListId = created.ids.trakt;
+            traktListUrl = `https://trakt.tv/users/${creds.trakt.username}/lists/${created.ids.slug}`;
+            traktPushedKeys = [];
+            result.traktListId = traktListId;
+            result.traktListUrl = traktListUrl;
+            this.logger.info(`   ✓ Created Trakt list "${schedule.playlistName}" (id ${traktListId}) — ${traktListUrl}`);
+          }
+        } else if (!traktListUrl && !dryRun) {
+          // Self-heal: a list created before this fix has an id but no correct URL stored.
+          try {
+            const headers = {
+              'Authorization': 'Bearer ' + creds.trakt.accessToken,
+              'trakt-api-version': '2',
+              'trakt-api-key': creds.trakt.clientId || ''
+            };
+            const listInfo = await axios.get(`https://api.trakt.tv/users/me/lists/${traktListId}`, { headers, timeout: 10000 });
+            traktListUrl = `https://trakt.tv/users/${creds.trakt.username}/lists/${listInfo.data.ids.slug}`;
+            result.traktListUrl = traktListUrl;
+            this.logger.info(`   ✓ Recovered Trakt list URL — ${traktListUrl}`);
+          } catch (e) {
+            this.logger.warn(`   Could not recover Trakt list URL: ${e.message}`);
+          }
+        } else {
+          result.traktListUrl = traktListUrl;
+        }
+
+        // Compute the diff even in dry-run-before-creation, when there's no real
+        // listId yet — prevKeys is simply empty for a brand new (or recreated) list,
+        // so this still gives an accurate "everything would be added" count.
+        if (traktListId || dryRun) {
+          const prevKeys = new Set(traktPushedKeys);
+          const toAdd = items.filter(i => !prevKeys.has(i.imdb || String(i.tmdb)));
+          const toRemoveKeys = traktPushedKeys.filter(k => !currentKeys.has(k));
+
+          if (toAdd.length && !dryRun) {
+            const addResp = await this.addItemsToTraktList(traktListId, toAdd, creds);
+            const notFoundKeys = new Set((addResp.not_found && addResp.not_found.movies || []).map(m =>
+              (m.ids && (m.ids.imdb || m.ids.tmdb)) || ''
+            ));
+            const actuallyAdded = toAdd.filter(i => !notFoundKeys.has(i.imdb || String(i.tmdb)));
+            actuallyAdded.forEach(i => traktPushedKeys.push(i.imdb || String(i.tmdb)));
+            if (actuallyAdded.length < toAdd.length) {
+              this.logger.warn(`   Trakt rejected ${toAdd.length - actuallyAdded.length} item(s) as not_found — will retry next run, not marked as pushed`);
+            }
+            result.traktAdded = actuallyAdded.length;
+          } else {
+            result.traktAdded = toAdd.length;
+          }
+
+          if (toRemoveKeys.length && !dryRun) {
+            const toRemoveItems = toRemoveKeys.map(k => ({ imdb: k.startsWith('tt') ? k : null, tmdb: k.startsWith('tt') ? null : k }));
+            await this.removeItemsFromTraktList(traktListId, toRemoveItems, creds);
+            // Unlike add, a not_found response here actually confirms the desired end state
+            // (the item isn't on the list) just as much as a "removed" response would — so as
+            // long as the call itself didn't throw, clearing pushedKeys is correct either way.
+            traktPushedKeys = traktPushedKeys.filter(k => !toRemoveKeys.includes(k));
+          }
+          result.traktRemoved = toRemoveKeys.length;
+        }
+
+        // Commit the local working values back onto persisted state — only for real runs
+        if (!dryRun) {
+          state.trakt.listId = traktListId;
+          state.trakt.listUrl = traktListUrl;
+          state.trakt.pushedKeys = traktPushedKeys;
+        }
+      } catch (e) {
+        const status = e.response ? e.response.status : '???';
+        this.logger.warn(`   Trakt publish failed for "${schedule.playlistName}" [${status}]: ${e.message}`);
+        result.errors.push({ service: 'trakt', error: e.message });
+      }
+    }
+
+    // ---- MDBlists ----
+    const mdblistApiKey = schedule.mdblistApiKey || creds.mdblistApiKey;
+
+    if (schedule.publishToMDBlists && mdblistApiKey) {
+      try {
+        let mdblistListId = state.mdblist.listId;
+        let mdblistListUrl = state.mdblist.listUrl;
+        let mdblistPushedKeys = state.mdblist.pushedKeys;
+
+        if (mdblistListId) {
+          const exists = await this.mdblistExists(mdblistListId, mdblistApiKey);
+          if (!exists) {
+            this.logger.warn(`   MDBlists list ${mdblistListId} no longer exists (deleted externally?) — will recreate`);
+            mdblistListId = null;
+            mdblistListUrl = null;
+            mdblistPushedKeys = [];
+          }
+        }
+
+        if (!mdblistListId) {
+          if (dryRun) {
+            result.mdblistListId = 'would-create';
+          } else {
+            const created = await this.createMDBList(schedule.playlistName, mdblistApiKey);
+            mdblistListId = created.id;
+            mdblistListUrl = created.url;
+            mdblistPushedKeys = [];
+            result.mdblistListId = created.id;
+            result.mdblistListUrl = created.url;
+            this.logger.info(`   ✓ Created MDBlists list "${schedule.playlistName}" (id ${created.id}, ${created.url})`);
+          }
+        } else {
+          result.mdblistListUrl = mdblistListUrl;
+        }
+
+        if (mdblistListId || dryRun) {
+          const prevKeys = new Set(mdblistPushedKeys);
+          const toAdd = items.filter(i => !prevKeys.has(i.imdb || String(i.tmdb)));
+          const toRemoveKeys = mdblistPushedKeys.filter(k => !currentKeys.has(k));
+
+          if (toAdd.length && !dryRun) {
+            const addResp = await this.addItemsToMDBList(mdblistListId, toAdd, mdblistApiKey);
+            const failedCount = (addResp.not_found && addResp.not_found.movies) || 0;
+            if (failedCount > 0) {
+              // MDBlists only reports a count, not which items — can't isolate the failure,
+              // so mark none as pushed and retry the whole batch next run (safe: re-adding
+              // already-successful items is a no-op per MDBlists' own "existing" field)
+              this.logger.warn(`   MDBlists reported ${failedCount} not_found of ${toAdd.length} — none marked as pushed, will retry full batch next run`);
+              result.mdblistAdded = 0;
+            } else {
+              toAdd.forEach(i => mdblistPushedKeys.push(i.imdb || String(i.tmdb)));
+              result.mdblistAdded = toAdd.length;
+            }
+          } else {
+            result.mdblistAdded = toAdd.length;
+          }
+
+          if (toRemoveKeys.length && !dryRun) {
+            const toRemoveItems = toRemoveKeys.map(k => ({ imdb: k.startsWith('tt') ? k : null, tmdb: k.startsWith('tt') ? null : k }));
+            const removeResp = await this.removeItemsFromMDBList(mdblistListId, toRemoveItems, mdblistApiKey);
+            if (removeResp.not_found && removeResp.not_found.movies > 0) {
+              this.logger.warn(`   MDBlists remove reported ${removeResp.not_found.movies} not_found — list state may be out of sync, treat with caution`);
+            }
+            mdblistPushedKeys = mdblistPushedKeys.filter(k => !toRemoveKeys.includes(k));
+          }
+          result.mdblistRemoved = toRemoveKeys.length;
+        }
+
+        // Commit the local working values back onto persisted state — only for real runs
+        if (!dryRun) {
+          state.mdblist.listId = mdblistListId;
+          state.mdblist.listUrl = mdblistListUrl;
+          state.mdblist.pushedKeys = mdblistPushedKeys;
+        }
+      } catch (e) {
+        const status = e.response ? e.response.status : '???';
+        this.logger.warn(`   MDBlists publish failed for "${schedule.playlistName}" [${status}]: ${e.message}`);
+        result.errors.push({ service: 'mdblist', error: e.message });
+      }
+    }
+
+    if (!dryRun) this.savePublishState(publishState);
     return result;
   }
 

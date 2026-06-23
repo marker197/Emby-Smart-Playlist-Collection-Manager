@@ -4732,7 +4732,8 @@ async function syncCredentialsToBackend(){
         username: S.traktUsername || '',
         clientId: ''
       } : null,
-      radarrServers: (S.radarrServers || []).map(function(s){ return { name: s.name, url: s.url, apiKey: s.apiKey }; })
+      radarrServers: (S.radarrServers || []).map(function(s){ return { name: s.name, url: s.url, apiKey: s.apiKey }; }),
+      mdblistApiKey: (el('mdblistApiKey') && el('mdblistApiKey').value || '').trim() || null
     };
 
     // Resolve decrypted client id (stored encrypted) for the trakt-api-key header
@@ -9697,8 +9698,10 @@ function restoreMdblistSettings(){
           decryptData(apiKeyObj.data, apiKeyObj.salt).then(function(apiKey){
             el('mdblistApiKey').value = apiKey;
             console.log('✓ Restored API key (encrypted)');
+            syncCredentialsToBackend();
           }).catch(function(err){
             el('mdblistApiKey').value = savedApiKey;
+            syncCredentialsToBackend();
           });
         }else{
           throw new Error('Not encrypted format');
@@ -9707,6 +9710,7 @@ function restoreMdblistSettings(){
         // Plain text API key
         el('mdblistApiKey').value = savedApiKey;
         console.log('✓ Restored API key (plain text)');
+        syncCredentialsToBackend();
       }
     }
     
@@ -9781,6 +9785,7 @@ window.addEventListener('load', function(){
           }catch(e){
             console.error('Error saving API key:', e);
           }
+          syncCredentialsToBackend();
         }
       };
       
@@ -12269,6 +12274,29 @@ async function sendMoviesToRadarr(movieTitles, radarrServerId){
 
             container.innerHTML = APP_STATE.schedules.map(sched => {
                 const rule = APP_STATE.rules.find(r => r.id === sched.ruleId);
+                const publishToTrakt = !!sched.publishToTrakt;
+                const publishToMDBlists = !!sched.publishToMDBlists;
+                const traktListId = sched.traktListId || null;
+                const mdblistListId = sched.mdblistListId || null;
+
+                let mdblistKeyStatusHtml = '';
+                if (publishToMDBlists) {
+                    if (sched.mdblistApiKey) {
+                        mdblistKeyStatusHtml = '<div style="font-size:11px;color:var(--text-muted,#999);margin:2px 0 8px;">'
+                            + 'Using a custom API key for this schedule. '
+                            + '<a href="#" onclick="setMdblistApiKeyForSchedule(' + JSON.stringify(sched.id) + ', \'\');return false;" style="color:var(--accent);">Use account key instead</a>'
+                            + '</div>';
+                    } else {
+                        mdblistKeyStatusHtml = '<div style="font-size:11px;color:var(--text-muted,#999);margin:2px 0 8px;">'
+                            + 'Using your account\u2019s MDBlists API key automatically. '
+                            + '<a href="#" onclick="sEl(' + JSON.stringify('mdblistKeyOverride_' + sched.id) + ').style.display=\'block\';return false;" style="color:var(--accent);">Use a different key</a>'
+                            + '<div id="mdblistKeyOverride_' + sched.id + '" style="display:none;margin-top:6px;">'
+                            + '<input type="text" placeholder="Custom MDBlists API key for this schedule" onblur="setMdblistApiKeyForSchedule(' + JSON.stringify(sched.id) + ', this.value)" style="width:100%;padding:6px 8px;font-size:12px;border-radius:var(--radius);border:1px solid var(--border);background:var(--surface2);color:var(--text);">'
+                            + '</div>'
+                            + '</div>';
+                    }
+                }
+
                 return `
                     <div class="schedule-item">
                         <h4>${sched.playlistName}</h4>
@@ -12291,6 +12319,24 @@ async function sendMoviesToRadarr(movieTitles, radarrServerId){
                             </button>
                             <button class="btn btn-primary btn-small" onclick="runScheduleNow('${sched.id}')">Run Now</button>
                             <button class="btn btn-danger btn-small" onclick="deleteSchedule('${sched.id}')">Delete</button>
+                        </div>
+                        <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border,#333);">
+                            <p class="text-small text-muted" style="margin-bottom:6px;">Publish this list to:</p>
+                            <label style="display:flex;align-items:center;gap:8px;margin-bottom:6px;font-size:13px;cursor:pointer;">
+                                <input type="checkbox" ${publishToTrakt?'checked':''} onchange="togglePublishToTrakt('${sched.id}', this.checked)">
+                                <span>Trakt${sched.traktListUrl ? ' — <a href="'+esc(sched.traktListUrl)+'" target="_blank" style="color:var(--accent);">view list</a>' : (traktListId ? ' (created, fetching link…)' : '')}</span>
+                            </label>
+                            <label style="display:flex;align-items:center;gap:8px;margin-bottom:6px;font-size:13px;cursor:pointer;">
+                                <input type="checkbox" ${publishToMDBlists?'checked':''} onchange="togglePublishToMDBlists('${sched.id}', this.checked)">
+                                <span>MDBlists${sched.mdblistListUrl ? ' — <a href="'+esc(sched.mdblistListUrl)+'" target="_blank" style="color:var(--accent);">view list</a>' : (mdblistListId ? ' (id '+mdblistListId+')' : '')}</span>
+                            </label>
+                            ${mdblistKeyStatusHtml}
+                            ${(publishToTrakt || publishToMDBlists) ? `
+                            <div style="display:flex;gap:8px;margin-top:6px;">
+                                <button class="btn btn-secondary btn-small" onclick="previewPublishSchedule('${sched.id}')">Preview</button>
+                                <button class="btn btn-primary btn-small" onclick="publishScheduleNow('${sched.id}')">Publish Now</button>
+                            </div>
+                            <div id="publishStatus_${sched.id}" style="font-size:11px;color:var(--text-muted,#999);margin-top:6px;"></div>` : ''}
                         </div>
                     </div>
                 `;
@@ -12332,6 +12378,94 @@ async function sendMoviesToRadarr(movieTitles, radarrServerId){
                     })
                     .catch(err => showToast('Error: ' + err.message, 'error'));
             }
+        }
+
+        function togglePublishToTrakt(schedId, enabled) {
+            sendToBackend('POST', `/api/smart/schedules/${schedId}/publish-settings`, { publishToTrakt: enabled })
+                .then(function(){
+                    const sched = APP_STATE.schedules.find(s => s.id === schedId);
+                    if(sched) sched.publishToTrakt = enabled;
+                    saveToLocalStorage();
+                    renderSchedules();
+                    showToast(enabled ? 'Trakt publishing enabled' : 'Trakt publishing disabled', 'success');
+                })
+                .catch(err => showToast('Error: ' + err.message, 'error'));
+        }
+
+        function togglePublishToMDBlists(schedId, enabled) {
+            sendToBackend('POST', `/api/smart/schedules/${schedId}/publish-settings`, { publishToMDBlists: enabled })
+                .then(function(){
+                    const sched = APP_STATE.schedules.find(s => s.id === schedId);
+                    if(sched) sched.publishToMDBlists = enabled;
+                    saveToLocalStorage();
+                    renderSchedules();
+                    showToast(enabled ? 'MDBlists publishing enabled' : 'MDBlists publishing disabled', 'success');
+                })
+                .catch(err => showToast('Error: ' + err.message, 'error'));
+        }
+
+        function setMdblistApiKeyForSchedule(schedId, apiKey) {
+            sendToBackend('POST', `/api/smart/schedules/${schedId}/publish-settings`, { mdblistApiKey: apiKey })
+                .then(function(){
+                    const sched = APP_STATE.schedules.find(s => s.id === schedId);
+                    if(sched) sched.mdblistApiKey = apiKey;
+                    saveToLocalStorage();
+                    showToast(apiKey ? 'Custom MDBlists API key saved for this schedule' : 'Reverted to your account\'s MDBlists API key', 'success');
+                    renderSchedules();
+                })
+                .catch(err => showToast('Error: ' + err.message, 'error'));
+        }
+
+        function previewPublishSchedule(schedId) {
+            const statusEl = sEl('publishStatus_' + schedId);
+            if(statusEl) statusEl.textContent = 'Checking…';
+
+            sendToBackend('POST', `/api/smart/schedules/${schedId}/publish`, { dryRun: true })
+                .then(function(result){
+                    if(!result.success){
+                        showToast('Preview failed: ' + (result.error||'Unknown error'), 'error');
+                        return;
+                    }
+                    const parts = [];
+                    if(result.traktListId) parts.push('Trakt: ' + (result.traktAdded||0) + ' would be added, ' + (result.traktRemoved||0) + ' would be removed' + (result.traktListId==='would-create' ? ' (new list would be created)' : ''));
+                    if(result.mdblistListId) parts.push('MDBlists: ' + (result.mdblistAdded||0) + ' would be added, ' + (result.mdblistRemoved||0) + ' would be removed' + (result.mdblistListId==='would-create' ? ' (new list would be created)' : ''));
+                    if(statusEl) statusEl.innerHTML = '<b>Preview:</b> ' + (parts.join('<br>') || 'Nothing to publish');
+                })
+                .catch(err => showToast('Preview failed: ' + err.message, 'error'));
+        }
+
+        function publishScheduleNow(schedId) {
+            const statusEl = sEl('publishStatus_' + schedId);
+            if(statusEl) statusEl.textContent = 'Updating Emby collection and publishing…';
+
+            // Reuses the same full pipeline as "Run Now" — updates the Emby collection
+            // first, then publishes to Trakt/MDBlists. Publishing was never meant to be
+            // a standalone action that could leave Emby out of step.
+            sendToBackend('POST', `/api/smart/schedules/${schedId}/run`, {})
+                .then(function(result){
+                    if(!result.success){
+                        showToast('Publish failed: ' + (result.error||'Unknown error'), 'error');
+                        if(statusEl) statusEl.textContent = '';
+                        return;
+                    }
+
+                    const pub = (result.execution && result.execution.publishResult) || {};
+                    const sched = APP_STATE.schedules.find(s => s.id === schedId);
+                    if(sched){
+                        if(pub.traktListUrl) sched.traktListUrl = pub.traktListUrl;
+                        if(pub.mdblistListUrl) sched.mdblistListUrl = pub.mdblistListUrl;
+                        sched.lastRun = new Date().toISOString();
+                        saveToLocalStorage();
+                    }
+
+                    const itemsMatched = (result.execution && result.execution.itemsMatched) || 0;
+                    const total = (pub.traktAdded||0) + (pub.mdblistAdded||0) + (pub.traktRemoved||0) + (pub.mdblistRemoved||0);
+                    showToast('✓ Emby collection updated (' + itemsMatched + ' items)' + (total > 0 ? ', ' + total + ' external change(s)' : ''), 'success');
+
+                    if(statusEl) statusEl.innerHTML = 'Emby: ' + itemsMatched + ' items &nbsp;·&nbsp; Trakt: +' + (pub.traktAdded||0) + '/-' + (pub.traktRemoved||0) + ' &nbsp;·&nbsp; MDBlists: +' + (pub.mdblistAdded||0) + '/-' + (pub.mdblistRemoved||0);
+                    renderSchedules();
+                })
+                .catch(err => showToast('Publish failed: ' + err.message, 'error'));
         }
 
         function deleteSchedule(schedId) {
@@ -12915,6 +13049,7 @@ async function sendMoviesToRadarr(movieTitles, radarrServerId){
         displayTopCollections();
         displayCleanupReport();
         displayGrowthTimeline();
+        displaySyncActivityTimeline();
         
         buildItemCache().then(function() {
           displayWatchedStats();
@@ -13542,6 +13677,115 @@ async function sendMoviesToRadarr(movieTitles, radarrServerId){
       }
     }
 
+    function calculateSyncActivityTimeline(syncs) {
+      const byDay = {};
+
+      syncs.forEach(function(s){
+        if(s.dryRun) return;
+        const day = (s.timestamp || '').slice(0, 10);
+        if(!day) return;
+        if(!byDay[day]) byDay[day] = { added: 0, removed: 0, watchedPushed: 0 };
+        byDay[day].added += (s.totalAddedToEmby || 0);
+        byDay[day].removed += (s.totalRemovedFromEmby || 0);
+        if(s.watchedSync){
+          byDay[day].watchedPushed += ((s.watchedSync.traktPushed||[]).length + (s.watchedSync.mdblistPushed||[]).length);
+        }
+      });
+
+      return Object.keys(byDay).sort().map(function(day){
+        return { day: day, added: byDay[day].added, removed: byDay[day].removed, watchedPushed: byDay[day].watchedPushed };
+      });
+    }
+
+    async function displaySyncActivityTimeline() {
+      try {
+        const r = await fetch('/api/sync-history');
+        if(!r.ok) return;
+        const data = await r.json();
+        if(!data.success) return;
+
+        const timeline = calculateSyncActivityTimeline(data.syncs || []);
+        const section = el('syncActivityTimelineSection');
+        const countEl = el('syncActivityCount');
+
+        if(timeline.length === 0){
+          if(section) section.style.display = 'none';
+          return;
+        }
+
+        if(section) section.style.display = 'block';
+        if(countEl) countEl.textContent = timeline.length;
+
+        loadChartLibrary().then(function(){
+          renderSyncActivityChart(timeline);
+        }).catch(function(e){
+          console.error('Failed to load Chart.js:', e);
+        });
+      } catch(e) {
+        console.warn('Could not load sync activity timeline:', e.message);
+      }
+    }
+
+    function renderSyncActivityChart(timeline) {
+      const ctx = el('syncActivityChart');
+      if(!ctx || !window.Chart) return;
+
+      if(ctx.chartInstance){
+        ctx.chartInstance.destroy();
+      }
+
+      const labels = timeline.map(function(t){ return t.day; });
+      const added = timeline.map(function(t){ return t.added; });
+      const removed = timeline.map(function(t){ return -t.removed; }); // negative so it draws below zero, mirroring "added"
+      const net = [];
+      let running = 0;
+      timeline.forEach(function(t){ running += (t.added - t.removed); net.push(running); });
+
+      try {
+        ctx.chartInstance = new window.Chart(ctx, {
+          data: {
+            labels: labels,
+            datasets: [
+              { type: 'bar', label: 'Added to Emby', data: added, backgroundColor: '#378ADD', borderRadius: 3, yAxisID: 'y', stack: 'changes' },
+              { type: 'bar', label: 'Removed from Emby', data: removed, backgroundColor: '#D85A30', borderRadius: 3, yAxisID: 'y', stack: 'changes' },
+              { type: 'line', label: 'Net collection size', data: net, borderColor: '#639922', backgroundColor: '#639922', borderWidth: 2, tension: 0.3, pointRadius: 3, yAxisID: 'y1' }
+            ]
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: true,
+            plugins: {
+              legend: {
+                display: true,
+                labels: { color: '#ffffff', font: { size: 12 }, padding: 12 }
+              }
+            },
+            scales: {
+              y: {
+                position: 'left',
+                ticks: { color: '#ffffff' },
+                grid: { color: 'rgba(255,255,255,0.1)' },
+                title: { display: true, text: 'Per day', color: '#ffffff' }
+              },
+              y1: {
+                position: 'right',
+                beginAtZero: true,
+                grid: { drawOnChartArea: false },
+                ticks: { color: '#ffffff' },
+                title: { display: true, text: 'Cumulative', color: '#ffffff' }
+              },
+              x: {
+                ticks: { color: '#ffffff' },
+                grid: { color: 'rgba(255,255,255,0.1)' }
+              }
+            }
+          }
+        });
+      } catch(e) {
+        console.error('Sync activity chart creation error:', e.message);
+      }
+    }
+
     function escapeHtml(text) {
       if(!text) return '';
       return text.replace(/[&<>"']/g, function(c) {
@@ -13727,6 +13971,23 @@ async function sendMoviesToRadarr(movieTitles, radarrServerId){
               <div class="analytics-collapsible-content open">
                 <div class="analytics-chart-container">
                   <canvas id="growthChart"></canvas>
+                </div>
+              </div>
+            </div>
+
+            <!-- Sync Activity Timeline — list-sync + watched-sync history, separate from collection creation dates above -->
+            <div class="analytics-collapsible-section" id="syncActivityTimelineSection" style="display: none;">
+              <div class="analytics-collapsible-header" onclick="toggleCollapsibleSection(this)">
+                <span class="analytics-collapsible-header-title">Sync Activity Timeline</span>
+                <div style="display: flex; align-items: center; gap: 12px;">
+                  <span class="analytics-collapsible-header-count" id="syncActivityCount">0</span>
+                  <span class="analytics-collapsible-toggle">▼</span>
+                </div>
+              </div>
+              <div class="analytics-collapsible-content open">
+                <p style="font-size:12px;color:var(--text2,#b0b0b0);margin:0 0 10px;">Items added/removed from Emby collections and watched-status pushes, per sync run.</p>
+                <div class="analytics-chart-container">
+                  <canvas id="syncActivityChart"></canvas>
                 </div>
               </div>
             </div>

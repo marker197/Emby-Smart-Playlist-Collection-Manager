@@ -125,7 +125,16 @@ const embyClient = new EmbyClient(
 );
 
 const rulesEngine = new RulesEngine(logger);
-const scheduler = new Scheduler(embyClient, rulesEngine, logger);
+
+const listSyncService = new ListSyncService({
+  dataDir: path.join(__dirname, 'data'),
+  logger,
+  embyUrl: process.env.EMBY_URL,
+  embyToken: process.env.EMBY_TOKEN,
+  embyUserId: process.env.EMBY_USER_ID
+});
+
+const scheduler = new Scheduler(embyClient, rulesEngine, logger, listSyncService);
 
 // Only initialize EmailService if Gmail credentials are provided
 const emailService = (process.env.GMAIL_ADDRESS && process.env.GMAIL_APP_PASSWORD) 
@@ -135,14 +144,6 @@ const emailService = (process.env.GMAIL_ADDRESS && process.env.GMAIL_APP_PASSWOR
       logger
     )
   : null;
-
-const listSyncService = new ListSyncService({
-  dataDir: path.join(__dirname, 'data'),
-  logger,
-  embyUrl: process.env.EMBY_URL,
-  embyToken: process.env.EMBY_TOKEN,
-  embyUserId: process.env.EMBY_USER_ID
-});
 
 // ═════════════════════════════════════════════
 // HEALTH CHECK & STATUS
@@ -260,7 +261,14 @@ app.get('/api/smart/schedules', (req, res) => {
         enabled: s.enabled,
         nextRun: s.nextRun,
         lastRun: s.lastRun,
-        createdAt: s.createdAt
+        createdAt: s.createdAt,
+        publishToTrakt: s.publishToTrakt || false,
+        publishToMDBlists: s.publishToMDBlists || false,
+        traktListId: s.traktListId || null,
+        traktListUrl: s.traktListUrl || null,
+        mdblistListId: s.mdblistListId || null,
+        mdblistListUrl: s.mdblistListUrl || null,
+        mdblistApiKey: s.mdblistApiKey || ''
       }))
     });
   } catch (error) {
@@ -357,6 +365,64 @@ app.post('/api/smart/schedules/:id/run', async (req, res) => {
     });
   } catch (error) {
     logger.error('Execute schedule failed', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Set per-schedule publish settings (Trakt/MDBlists) — toggled on an existing Smart Collection schedule
+app.post('/api/smart/schedules/:id/publish-settings', (req, res) => {
+  try {
+    const { publishToTrakt, publishToMDBlists, mdblistApiKey } = req.body;
+    const updates = {};
+    if (typeof publishToTrakt === 'boolean') updates.publishToTrakt = publishToTrakt;
+    if (typeof publishToMDBlists === 'boolean') updates.publishToMDBlists = publishToMDBlists;
+    if (typeof mdblistApiKey === 'string') updates.mdblistApiKey = mdblistApiKey;
+
+    const schedule = scheduler.updateSchedule(req.params.id, updates);
+    if (!schedule) {
+      return res.status(404).json({ success: false, error: 'Schedule not found' });
+    }
+    res.json({ success: true, schedule: { id: schedule.id, publishToTrakt: schedule.publishToTrakt, publishToMDBlists: schedule.publishToMDBlists, traktListId: schedule.traktListId, mdblistListId: schedule.mdblistListId } });
+  } catch (error) {
+    logger.error('Update publish settings failed', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Manual publish trigger / preview for a Smart Collection's Trakt/MDBlists lists
+app.post('/api/smart/schedules/:id/publish', async (req, res) => {
+  try {
+    const dryRun = !!(req.body && req.body.dryRun);
+    const schedule = scheduler.getSchedule ? scheduler.getSchedule(req.params.id) : scheduler.schedules.get(req.params.id);
+    if (!schedule) {
+      return res.status(404).json({ success: false, error: 'Schedule not found' });
+    }
+    if (!schedule.publishToTrakt && !schedule.publishToMDBlists) {
+      return res.status(400).json({ success: false, error: 'Publishing is not enabled for this schedule' });
+    }
+
+    const items = await embyClient.getLibraryItems();
+    const matchedItems = schedule.rule ? rulesEngine.evaluateRule(schedule.rule, items) : items;
+    const publishItems = matchedItems.map(i => ({
+      name: i.Name,
+      imdb: i.ProviderIds && (i.ProviderIds.Imdb || i.ProviderIds.IMDB) || null,
+      tmdb: i.ProviderIds && (i.ProviderIds.Tmdb || i.ProviderIds.TMDB) || null
+    })).filter(i => i.imdb || i.tmdb);
+
+    const result = await listSyncService.publishSmartList(schedule, publishItems, { dryRun });
+
+    if (!dryRun) {
+      const updates = {};
+      if (result.traktListId && result.traktListId !== 'would-create' && result.traktListId !== schedule.traktListId) updates.traktListId = result.traktListId;
+      if (result.mdblistListId && result.mdblistListId !== 'would-create' && result.mdblistListId !== schedule.mdblistListId) updates.mdblistListId = result.mdblistListId;
+      if (result.traktListUrl && result.traktListUrl !== schedule.traktListUrl) updates.traktListUrl = result.traktListUrl;
+      if (result.mdblistListUrl && result.mdblistListUrl !== schedule.mdblistListUrl) updates.mdblistListUrl = result.mdblistListUrl;
+      if (Object.keys(updates).length) scheduler.updateSchedule(req.params.id, updates);
+    }
+
+    res.json({ success: true, dryRun, ...result });
+  } catch (error) {
+    logger.error('Manual publish failed', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
@@ -1129,15 +1195,17 @@ app.post('/api/chrono/sync-metadata', express.json(), async (req, res) => {
 // Frontend pushes Trakt token + Radarr servers here so the backend can sync without the browser open
 app.post('/api/credentials/sync', express.json(), async (req, res) => {
   try {
-    const { trakt, radarrServers } = req.body;
+    const { trakt, radarrServers, mdblistApiKey } = req.body;
     const updated = listSyncService.saveCredentials({
       ...(trakt !== undefined ? { trakt } : {}),
-      ...(radarrServers !== undefined ? { radarrServers } : {})
+      ...(radarrServers !== undefined ? { radarrServers } : {}),
+      ...(mdblistApiKey !== undefined ? { mdblistApiKey } : {})
     });
     res.json({
       success: true,
       traktConnected: !!(updated.trakt && updated.trakt.accessToken),
-      radarrServerCount: (updated.radarrServers || []).length
+      radarrServerCount: (updated.radarrServers || []).length,
+      mdblistConnected: !!updated.mdblistApiKey
     });
   } catch (error) {
     logger.error('Credentials sync error', error);
@@ -1212,6 +1280,17 @@ app.get('/api/sync-status', (req, res) => {
     res.json({ success: true, ...listSyncService.getStatus() });
   } catch (error) {
     logger.error('Sync status error', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Full sync-run history for the Sync Activity Timeline chart (up to 500 runs)
+app.get('/api/sync-history', (req, res) => {
+  try {
+    const audit = listSyncService.loadAudit();
+    res.json({ success: true, syncs: audit.syncs || [] });
+  } catch (error) {
+    logger.error('Sync history error', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
