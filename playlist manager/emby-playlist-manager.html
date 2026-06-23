@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Emby Playlist Manager v2.0</title>
+    <link rel="icon" type="image/x-icon" href="/favicon.ico">
     <style>
 .app-shell { display: flex; flex-direction: column; min-height: 100vh; background: var(--bg); }
 .app-shell-header { background: var(--surface, #2d2d2d); border-bottom: 1px solid var(--border, #404040); padding: 14px 24px; position: fixed; top: 0; left: 0; right: 0; z-index: 51; }
@@ -20,6 +21,14 @@
 #navAnalyticsBtn { padding: 4px 8px; background: transparent; border: 1px solid transparent; color: #6c6bff; cursor: pointer; font-weight: 500; font-size: 12px; transition: all 0.15s ease; font-family: inherit; }
 #navAnalyticsBtn:hover { background: transparent; border: 1px solid #6c6bff; color: #6c6bff; }
 #navAnalyticsBtn:active { transform: scale(0.98); }
+#navSettingsBtn { padding: 4px 8px; background: transparent; border: 1px solid transparent; color: #9ca3af; cursor: pointer; font-weight: 500; font-size: 12px; transition: all 0.15s ease; font-family: inherit; }
+#navSettingsBtn:hover { background: transparent; border: 1px solid #9ca3af; color: #d1d5db; }
+#navSettingsBtn:active { transform: scale(0.98); }
+.nav-dropdown { position: relative; display: inline-block; }
+.nav-dropdown-menu { display: none; position: absolute; top: calc(100% + 6px); right: 0; background: var(--surface, #2d2d2d); border: 1px solid var(--border, #404040); border-radius: var(--radius, 8px); box-shadow: 0 10px 30px rgba(0,0,0,0.35); min-width: 170px; z-index: 60; padding: 6px; flex-direction: column; gap: 2px; }
+.nav-dropdown-menu.open { display: flex; }
+.nav-dropdown-menu button { display: block; width: 100%; text-align: left; background: transparent; border: none; color: var(--text2, #ccc); font-size: 13px; font-family: inherit; padding: 8px 10px; border-radius: 6px; cursor: pointer; transition: background .12s, color .12s; }
+.nav-dropdown-menu button:hover { background: var(--surface2, #383838); color: var(--text, #fff); }
 .app-shell-status { margin-left: auto; padding: 0 16px; font-size: 16px; color: var(--success, #4caf50); display: flex; align-items: center; gap: 15px; }
 .app-shell-panel { flex: 1; overflow-y: auto; padding-top: 135px; }
 
@@ -610,6 +619,7 @@ body{background:var(--bg);color:var(--text);font:15px/1.6 -apple-system,BlinkMac
 .settings-modal-bg{display:none;position:fixed;inset:0;background:rgba(0,0,0,.78);z-index:500;align-items:center;justify-content:center;padding:20px;}
 .settings-modal-bg.open{display:flex;}
 #syncPreviewModal{z-index:600;}
+#settingsModal{z-index:9000;}
 .settings-modal{background:var(--surface);border:1px solid var(--border2);border-radius:var(--radius-lg);width:100%;max-width:1000px;max-height:90vh;display:flex;flex-direction:column;overflow:hidden;}
 .settings-header{padding:18px 22px 0;display:flex;align-items:center;gap:10px;flex-shrink:0;}
 .settings-header h2{font-size:16px;font-weight:700;flex:1;}
@@ -1715,6 +1725,21 @@ canvas {
                         title="View collection analytics">
                   📊 Analytics
                 </button>
+                <div class="nav-dropdown" id="navSettingsDropdown">
+                    <button id="navSettingsBtn" onclick="toggleSettingsDropdown(event)"
+                            title="Settings — Trakt, MDBlists, Radarr, sync &amp; watched status">
+                      ⚙️ Settings ▾
+                    </button>
+                    <div class="nav-dropdown-menu" id="navSettingsMenu">
+                        <button onclick="openSettingsToTab('server');closeSettingsDropdown();">Sync Settings</button>
+                        <button onclick="openSettingsToTab('collections');closeSettingsDropdown();">Collections</button>
+                        <button onclick="openSettingsToTab('refresh-status');closeSettingsDropdown();">Refresh Status</button>
+                        <button onclick="openSettingsToTab('mdblist');closeSettingsDropdown();">MDBlists</button>
+                        <button onclick="openSettingsToTab('trakt');closeSettingsDropdown();">Trakt</button>
+                        <button onclick="openSettingsToTab('radarr');closeSettingsDropdown();">Radarr</button>
+                        <button onclick="openSettingsToTab('tmdb');closeSettingsDropdown();">TMDB</button>
+                    </div>
+                </div>
                 <span style="font-size: 12px; color: var(--accent); margin-right: 15px;">Rules: <span id="shellStatsRules">0</span></span>
                 <span style="font-size: 12px; color: var(--secondary); margin-right: 15px;">Schedules: <span id="shellStatsSchedules">0</span></span>
                 <span id="shellHealth">●</span>
@@ -2270,7 +2295,7 @@ canvas {
       </button>
       <button class="settings-tab" onclick="showSettingsTab('server')" id="stab-server">
         <svg width="13" height="13" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="4" rx="1"/><rect x="2" y="10" width="20" height="4" rx="1"/><rect x="2" y="17" width="20" height="4" rx="1"/><line x1="6" y1="5" x2="6.01" y2="5"/><line x1="6" y1="12" x2="6.01" y2="12"/><line x1="6" y1="19" x2="6.01" y2="19"/></svg>
-        Server
+        Sync Settings
       </button>
       <button class="settings-tab" onclick="showSettingsTab('backup')" id="stab-backup">
         <svg width="13" height="13" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
@@ -3449,37 +3474,69 @@ function dismissToast(t){
 
 /* ── Settings modal ── */
 function openSettings(){
-  // Populate server info pane
-  var info = el('settingsServerInfo');
-  if(info && S.serverUrl){
-    var user = S.users.find(function(u){return u.Id===S.userId;});
-    var userName = user ? user.Name : '—';
-    var cachedImg = localStorage.getItem('emby_img_' + S.userId);
-    
-    var html = '<strong style="color:var(--text);">'+esc(S.serverUrl)+'</strong><br>';
-    html += '<div style="display:flex;align-items:center;gap:8px;margin-top:8px;">';
-    
-    if(cachedImg){
-      html += '<img src="'+esc(cachedImg)+'" style="width:32px;height:32px;border-radius:50%;object-fit:cover;border:1px solid var(--border);">';
-    } else {
-      html += '<div style="display:inline-flex;width:32px;height:32px;min-width:32px;border-radius:50%;background:var(--accent);color:#fff;align-items:center;justify-content:center;font-size:14px;font-weight:600;line-height:1;">'+esc(userName.charAt(0).toUpperCase())+'</div>';
+  // Each of these is auxiliary (populates a pane) — none of them should ever be able
+  // to block the actual modal from opening. Previously a single thrown error partway
+  // through this function (e.g. from a panel-specific state not being ready yet)
+  // would silently abort everything below it, including the line that opens the modal.
+  try {
+    // Populate server info pane
+    var info = el('settingsServerInfo');
+    if(info && S.serverUrl){
+      var user = S.users.find(function(u){return u.Id===S.userId;});
+      var userName = user ? user.Name : '—';
+      var cachedImg = localStorage.getItem('emby_img_' + S.userId);
+      
+      var html = '<strong style="color:var(--text);">'+esc(S.serverUrl)+'</strong><br>';
+      html += '<div style="display:flex;align-items:center;gap:8px;margin-top:8px;">';
+      
+      if(cachedImg){
+        html += '<img src="'+esc(cachedImg)+'" style="width:32px;height:32px;border-radius:50%;object-fit:cover;border:1px solid var(--border);">';
+      } else {
+        html += '<div style="display:inline-flex;width:32px;height:32px;min-width:32px;border-radius:50%;background:var(--accent);color:#fff;align-items:center;justify-content:center;font-size:14px;font-weight:600;line-height:1;">'+esc(userName.charAt(0).toUpperCase())+'</div>';
+      }
+      
+      html += '<span style="font-size:12px;">User: <strong>'+esc(userName)+'</strong></span></div>';
+      info.innerHTML = html;
     }
-    
-    html += '<span style="font-size:12px;">User: <strong>'+esc(userName)+'</strong></span></div>';
-    info.innerHTML = html;
-  }
-  updateThemeButtons(); // Update theme button states
-  // Refresh quality profiles for all configured servers
-  S.radarrServers.forEach(function(srv, idx){
-    if(srv.url && srv.apiKey){
-      refreshRadarrServerQuality(idx);
-    }
-  });
-  refreshCollectionsDashboard(); // Refresh collections dashboard
-  loadSyncStatusUI();
+  } catch(e){ console.warn('openSettings: server info pane failed:', e.message); }
+
+  try { updateThemeButtons(); } catch(e){ console.warn('openSettings: theme buttons failed:', e.message); }
+
+  try {
+    (S.radarrServers || []).forEach(function(srv, idx){
+      if(srv.url && srv.apiKey){
+        refreshRadarrServerQuality(idx);
+      }
+    });
+  } catch(e){ console.warn('openSettings: radarr quality refresh failed:', e.message); }
+
+  try { refreshCollectionsDashboard(); } catch(e){ console.warn('openSettings: collections dashboard failed:', e.message); }
+  try { loadSyncStatusUI(); } catch(e){ console.warn('openSettings: sync status failed:', e.message); }
+
+  // The one thing that must always happen, no matter what failed above
   el('settingsModal').classList.add('open');
 }
 function closeSettings(){ el('settingsModal').classList.remove('open'); }
+
+// Used by the nav dropdown — opens the modal and jumps straight to the requested
+// tab, instead of always landing on the default Collections tab first
+function openSettingsToTab(tabName){
+  openSettings();
+  showSettingsTab(tabName);
+}
+
+function toggleSettingsDropdown(e){
+  if(e) e.stopPropagation();
+  el('navSettingsMenu').classList.toggle('open');
+}
+function closeSettingsDropdown(){
+  var menu = el('navSettingsMenu');
+  if(menu) menu.classList.remove('open');
+}
+document.addEventListener('click', function(e){
+  var dropdown = el('navSettingsDropdown');
+  if(dropdown && !dropdown.contains(e.target)) closeSettingsDropdown();
+});
 function closeImportModal(){ el('importModal').classList.remove('open'); }
 function openCollectionInEmby(collId){
   if(!collId || !S.serverUrl){
@@ -4360,18 +4417,33 @@ async function refreshOverviewData(){
 }
 
 // Auto-update "Last Updated" every 30 seconds
+var _overviewTimerIntervalId = null;
 function startOverviewTimerUpdater(){
-  setInterval(async function(){
-    var statsContainer = el('landingStatsContainer');
-    if(!statsContainer || statsContainer.innerHTML === '') return;
-    
-    var stats = await calculateLandingStats();
-    var timeText = formatTimeAgo(stats.lastUpdated);
-    
-    // Update only the Last Updated card (3rd card)
-    var cards = statsContainer.querySelectorAll('.landing-stat-card');
-    if(cards.length >= 3){
-      cards[2].querySelector('.landing-stat-value').textContent = timeText;
+  // renderLandingPage() runs on every tab switch, login, and manual refresh —
+  // without this guard, each call stacked another interval on top of the last,
+  // forever, with nothing ever clearing the old ones.
+  if(_overviewTimerIntervalId){
+    clearInterval(_overviewTimerIntervalId);
+    _overviewTimerIntervalId = null;
+  }
+
+  _overviewTimerIntervalId = setInterval(async function(){
+    try {
+      var statsContainer = el('landingStatsContainer');
+      if(!statsContainer || statsContainer.innerHTML === '') return;
+      
+      var stats = await calculateLandingStats();
+      var timeText = formatTimeAgo(stats.lastUpdated);
+      
+      // Update only the Last Updated card (3rd card)
+      var cards = statsContainer.querySelectorAll('.landing-stat-card');
+      if(cards.length >= 3){
+        cards[2].querySelector('.landing-stat-value').textContent = timeText;
+      }
+    } catch(e){
+      // Whatever the exact cause, this is a 30s cosmetic timestamp refresh —
+      // never worth it bubbling up as an uncaught error
+      console.warn('Overview timer update failed:', e.message);
     }
   }, 30000); // Update every 30 seconds
 }
@@ -5216,7 +5288,6 @@ function renderSyncStatus(s){
     var radarrOn = (S_savedCollections || []).filter(function(c){
       return (c.source === 'Trakt' || c.source === 'MDBlists') && c.radarrAutoSend;
     });
-    console.log('[renderSyncStatus] radarrAutoSend per collection:', (S_savedCollections||[]).map(function(c){return {name:c.name, source:c.source, radarrAutoSend:c.radarrAutoSend};}));
     if(radarrOn.length){
       lines.push('Radarr auto-send on for: '+radarrOn.map(function(c){return esc(c.name);}).join(', '));
     } else {
@@ -5283,7 +5354,19 @@ async function previewListSync(){
     var bodyHtml = '';
     var collections = result.collections || [];
 
-    if(collections.length === 0){
+    if(result.listGone && result.listGone.length){
+      result.listGone.forEach(function(gone){
+        var reasonText = gone.reason === 'deleted' ? 'no longer exists on '+gone.source
+          : gone.reason === 'unliked' ? 'is no longer in your Trakt liked lists'
+          : 'came back empty from '+gone.source;
+        bodyHtml += '<div style="background:var(--surface2);border:1px solid var(--danger);border-radius:var(--radius);padding:10px 12px;margin-bottom:8px;">';
+        bodyHtml += '<strong style="display:block;margin-bottom:4px;font-size:13px;">'+esc(gone.name)+'</strong>';
+        bodyHtml += '<div style="font-size:12px;color:var(--danger);">⚠ '+reasonText+' — nothing changed yet. Running a real sync will ask whether to delete the Emby collection.</div>';
+        bodyHtml += '</div>';
+      });
+    }
+
+    if(collections.length === 0 && !(result.listGone && result.listGone.length)){
       bodyHtml = '<p style="font-size:13px;color:var(--text3);text-align:center;padding:10px 0;">No Trakt/MDBlists collections to check.</p>';
     } else {
       collections.forEach(function(c){
@@ -5365,10 +5448,64 @@ async function triggerListSyncNow(){
     } : result);
     loadSyncStatusUI();
 
+    // A list being genuinely gone (deleted or emptied at the source) is a destructive
+    // decision point, not just an error — ask before touching the Emby collection or
+    // any saved data. Handled one at a time, sequentially, since it should be rare.
+    if(result.listGone && result.listGone.length){
+      for(const gone of result.listGone){
+        await confirmAndTeardownGoneCollection(gone);
+      }
+    }
+
   }catch(e){
     toast('Sync request failed: '+e.message, 'err');
   } finally {
     if(btn){ btn.disabled = false; btn.innerHTML = originalHtml; }
+  }
+}
+
+async function confirmAndTeardownGoneCollection(gone){
+  var reasonText = gone.reason === 'deleted'
+    ? 'no longer exists on '+gone.source+' (it may have been deleted there)'
+    : gone.reason === 'unliked'
+    ? 'is no longer in your Trakt liked lists'
+    : 'came back completely empty from '+gone.source;
+
+  var confirmed = await showConfirmModal(
+    'List appears to be gone',
+    '"'+gone.name+'" '+reasonText+'. Delete the matching Emby collection and remove it from this app\'s saved data? This cannot be undone.'
+  );
+
+  if(!confirmed){
+    toast('Kept "'+gone.name+'" — will ask again next sync', 'inf', 3000);
+    return;
+  }
+
+  try{
+    var r = await fetch('/api/chrono/collections/'+encodeURIComponent(gone.id)+'/teardown', { method: 'POST' });
+    var result = await r.json();
+
+    if(!result.success){
+      toast('Could not delete "'+gone.name+'": '+(result.error||'Unknown error'), 'err');
+      return;
+    }
+
+    // Clean up local state to match — remove from in-memory/localStorage collections
+    // and clear its missing-movies cache, same cleanup the rest of the app expects
+    if(typeof S_savedCollections !== 'undefined'){
+      var idx = S_savedCollections.findIndex(function(c){ return c.embyId === gone.id; });
+      if(idx > -1){
+        S_savedCollections.splice(idx, 1);
+        try{ localStorage.setItem('cp_saved_collections', JSON.stringify(S_savedCollections)); }catch(e){}
+      }
+    }
+    try{ localStorage.removeItem('cp_collection_missing_movies_'+gone.id); }catch(e){}
+
+    toast('✓ Deleted "'+gone.name+'" and its saved data', 'ok', 3500);
+    refreshCollectionCounts();
+    if(typeof refreshCollectionsDashboard === 'function') refreshCollectionsDashboard();
+  }catch(e){
+    toast('Teardown request failed: '+e.message, 'err');
   }
 }
 
@@ -10213,6 +10350,19 @@ function closeWelcome(done){
 (function restoreLogin(){
   document.addEventListener('DOMContentLoaded', async function(){
     loadTheme(); // Load user's theme preference immediately
+
+    // settingsModal is physically nested inside #chronoPanel in the markup, which
+    // has display:none whenever that tab isn't active — meaning the modal silently
+    // fails to render at all from Overview/Smart Playlist, regardless of its own
+    // styles, since a display:none ancestor hides everything inside it. Relocating
+    // it to be a direct child of <body> escapes that entirely. Must run before the
+    // early-return below, since this needs to happen for every user regardless of
+    // saved-login state.
+    var settingsModalEl = document.getElementById('settingsModal');
+    if (settingsModalEl && settingsModalEl.parentElement !== document.body) {
+      document.body.appendChild(settingsModalEl);
+    }
+
     var saved = await loadCredentials();
     if (!saved || !saved.remember) return;
 
@@ -11346,21 +11496,25 @@ async function refreshCollectionFromSourceManual(collIndex){
   } else if(coll.source === 'MDBlists'){
     newTitles = await fetchMdblistsItemsForRefresh(coll);
     
-    // Also fetch description from MDBlists
-    try {
-      var curlCmd = "curl -s -X 'GET' 'https://api.mdblist.com/lists/"+coll.sourceListId+"?apikey="+coll.sourceListApiKey+"' -H 'accept: application/json'";
-      var response = await fetch('http://localhost:5001/api/chrono/mdblist?cmd=' + encodeURIComponent(curlCmd));
-      if(response.ok){
-        var responseData = (await response.json()).data;
-        
-        // MDBlists returns an array, get the first element
-        var listData = Array.isArray(responseData) ? responseData[0] : responseData;
-        console.log('  📥 Response keys:', Object.keys(listData || {}));
-        
-        newDescription = listData && listData.description ? listData.description : null;
+    // Also fetch description from MDBlists — skipped for the watchlist sentinel,
+    // since MDBlists' watchlist isn't a named list and has no description to fetch
+    var isWatchlistColl = coll.sourceListId === '_watchlist' || coll.isWatchlist === true;
+    if(!isWatchlistColl){
+      try {
+        var curlCmd = "curl -s -X 'GET' 'https://api.mdblist.com/lists/"+coll.sourceListId+"?apikey="+coll.sourceListApiKey+"' -H 'accept: application/json'";
+        var response = await fetch('http://localhost:5001/api/chrono/mdblist?cmd=' + encodeURIComponent(curlCmd));
+        if(response.ok){
+          var responseData = (await response.json()).data;
+          
+          // MDBlists returns an array, get the first element
+          var listData = Array.isArray(responseData) ? responseData[0] : responseData;
+          console.log('  📥 Response keys:', Object.keys(listData || {}));
+          
+          newDescription = listData && listData.description ? listData.description : null;
+        }
+      } catch(e){
+        console.warn('  Could not fetch MDBlists description:', e.message);
       }
-    } catch(e){
-      console.warn('  Could not fetch MDBlists description:', e.message);
     }
   }
   
@@ -11570,6 +11724,31 @@ async function fetchTraktListItemsForRefresh(coll){
 
 async function fetchMdblistsItemsForRefresh(coll){
   try{
+    var isWatchlist = coll.sourceListId === '_watchlist' || coll.isWatchlist === true;
+    var titles = [];
+
+    if(isWatchlist){
+      // MDBlists' watchlist isn't addressable by list ID at all — it lives at a
+      // completely different endpoint, queried once per media type
+      var movieCmd = "curl -s -X 'GET' 'https://api.mdblist.com/watchlist/items/?mediatype=movie&apikey="+coll.sourceListApiKey+"' -H 'accept: application/json'";
+      var showCmd = "curl -s -X 'GET' 'https://api.mdblist.com/watchlist/items/?mediatype=show&apikey="+coll.sourceListApiKey+"' -H 'accept: application/json'";
+
+      var [movieResp, showResp] = await Promise.all([
+        fetch('http://localhost:5001/api/chrono/mdblist?cmd=' + encodeURIComponent(movieCmd)),
+        fetch('http://localhost:5001/api/chrono/mdblist?cmd=' + encodeURIComponent(showCmd))
+      ]);
+
+      var movieData = movieResp.ok ? (await movieResp.json()).data : {};
+      var showData = showResp.ok ? (await showResp.json()).data : {};
+
+      [movieData, showData].forEach(function(data){
+        if(Array.isArray(data.movies)) data.movies.forEach(function(m){ if(m.title) titles.push(m.title); });
+        if(Array.isArray(data.shows)) data.shows.forEach(function(s){ if(s.title) titles.push(s.title); });
+      });
+
+      return titles;
+    }
+
     // Build curl command using stored API key
     var curlCmd = "curl -s -X 'GET' 'https://api.mdblist.com/lists/"+coll.sourceListId+"/items?apikey="+coll.sourceListApiKey+"' -H 'accept: application/json'";
     
@@ -11583,7 +11762,6 @@ async function fetchMdblistsItemsForRefresh(coll){
     var data = (await response.json()).data;
     
     // Extract titles from MDBlists response format
-    var titles = [];
     if(Array.isArray(data.movies)){
       data.movies.forEach(function(movie){
         if(movie.title) titles.push(movie.title);

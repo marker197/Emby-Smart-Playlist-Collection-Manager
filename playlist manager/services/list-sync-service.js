@@ -153,6 +153,41 @@ class ListSyncService {
   // FETCH FROM SOURCE
   // ═════════════════════════════════════════════
 
+  // All of the user's currently-liked lists, as a Set of both numeric ids and slugs —
+  // used to detect "unliked" as distinct from "deleted" or "emptied", since unliking
+  // someone else's list doesn't touch the list's own content or existence at all.
+  async fetchTraktLikedListIds(creds) {
+    const headers = {
+      'Authorization': 'Bearer ' + creds.trakt.accessToken,
+      'trakt-api-version': '2',
+      'trakt-api-key': creds.trakt.clientId || ''
+    };
+    const response = await axios.get('https://api.trakt.tv/users/likes/lists', { headers, timeout: 15000 });
+    const likedLists = (response.data || []).map(item => item.list || item);
+
+    const ids = new Set();
+    likedLists.forEach(l => {
+      if (l.ids) {
+        if (l.ids.trakt) ids.add(String(l.ids.trakt));
+        if (l.ids.slug) ids.add(String(l.ids.slug));
+      }
+    });
+    return ids;
+  }
+
+  // Pulls {title, year, imdb, tmdb} out of a Trakt movie object — same shape used
+  // throughout this file (sync/history, custom lists, etc.), so this is just
+  // reading fields that were always there but previously discarded.
+  extractTraktMovie(movie) {
+    if (!movie || !movie.title) return null;
+    return {
+      title: movie.title,
+      year: movie.year || null,
+      imdb: (movie.ids && movie.ids.imdb) || null,
+      tmdb: (movie.ids && movie.ids.tmdb) || null
+    };
+  }
+
   async fetchTraktList(coll, creds) {
     if (!creds || !creds.trakt || !creds.trakt.accessToken) {
       throw new Error('Trakt not connected (connect it in the app first)');
@@ -184,7 +219,7 @@ class ListSyncService {
     try {
       const response = await axios.get(url, { headers, timeout: 15000 });
       const items = response.data || [];
-      return items.map(i => (i.movie ? i.movie.title : i.title)).filter(Boolean);
+      return items.map(i => this.extractTraktMovie(i.movie || i)).filter(Boolean);
     } catch (e) {
       const status = e.response ? e.response.status : '???';
 
@@ -211,7 +246,7 @@ class ListSyncService {
             coll._idHealed = true;
             this.logger.info(`   ✓ Resolved "${coll.name}" to numeric list ID ${match.ids.trakt} — saved for future syncs`);
 
-            return items.map(i => (i.movie ? i.movie.title : i.title)).filter(Boolean);
+            return items.map(i => this.extractTraktMovie(i.movie || i)).filter(Boolean);
           } else {
             this.logger.warn(`   Could not find "${coll.name}" in your liked lists — it may have been unliked on Trakt`);
           }
@@ -223,7 +258,9 @@ class ListSyncService {
       const body = e.response ? JSON.stringify(e.response.data).slice(0, 200) : e.message;
       this.logger.warn(`Trakt fetch failed [${status}] for "${coll.name}" → ${url}`);
       this.logger.warn(`  Response: ${body}`);
-      throw new Error(`Trakt HTTP ${status}`);
+      const err = new Error(`Trakt HTTP ${status}`);
+      err.status = status;
+      throw err;
     }
   }
 
@@ -234,6 +271,19 @@ class ListSyncService {
 
     const isWatchlist = coll.sourceListId === '_watchlist' || coll.isWatchlist === true;
 
+    // MDBlists' field is release_year, not year — confirmed against a real response.
+    // ids.imdb/ids.tmdb sit in the same nested shape used by sync/watched and
+    // sync/collection elsewhere in this file.
+    const extractMDBItem = (item) => {
+      if (!item || !item.title) return null;
+      return {
+        title: item.title,
+        year: item.release_year || null,
+        imdb: (item.ids && item.ids.imdb) || item.imdb_id || null,
+        tmdb: (item.ids && item.ids.tmdb) || null
+      };
+    };
+
     try {
       if (isWatchlist) {
         const [movies, shows] = await Promise.all([
@@ -242,10 +292,10 @@ class ListSyncService {
         ]);
 
         const titles = [];
-        (movies.data.movies || []).forEach(m => m.title && titles.push(m.title));
-        (movies.data.shows || []).forEach(s => s.title && titles.push(s.title));
-        (shows.data.movies || []).forEach(m => m.title && titles.push(m.title));
-        (shows.data.shows || []).forEach(s => s.title && titles.push(s.title));
+        (movies.data.movies || []).forEach(m => { const r = extractMDBItem(m); if (r) titles.push(r); });
+        (movies.data.shows || []).forEach(s => { const r = extractMDBItem(s); if (r) titles.push(r); });
+        (shows.data.movies || []).forEach(m => { const r = extractMDBItem(m); if (r) titles.push(r); });
+        (shows.data.shows || []).forEach(s => { const r = extractMDBItem(s); if (r) titles.push(r); });
         return titles;
       }
 
@@ -254,15 +304,17 @@ class ListSyncService {
       const data = response.data || {};
 
       const titles = [];
-      (data.movies || []).forEach(m => m.title && titles.push(m.title));
-      (data.shows || []).forEach(s => s.title && titles.push(s.title));
-      (data.episodes || []).forEach(e => e.title && titles.push(e.title));
+      (data.movies || []).forEach(m => { const r = extractMDBItem(m); if (r) titles.push(r); });
+      (data.shows || []).forEach(s => { const r = extractMDBItem(s); if (r) titles.push(r); });
+      (data.episodes || []).forEach(e => { const r = extractMDBItem(e); if (r) titles.push(r); });
       return titles;
 
     } catch (e) {
       const status = e.response ? e.response.status : '???';
       this.logger.warn(`MDBlists fetch failed [${status}] for "${coll.name}" (listId: ${coll.sourceListId})`);
-      throw new Error(`MDBlists HTTP ${status}`);
+      const err = new Error(`MDBlists HTTP ${status}`);
+      err.status = status;
+      throw err;
     }
   }
 
@@ -277,7 +329,7 @@ class ListSyncService {
   // ═════════════════════════════════════════════
 
   async fetchLibraryItems() {
-    const url = `${this.embyUrl}/Items?IncludeItemTypes=Movie,Series&Recursive=true&Fields=Id,Name&Limit=10000&UserId=${this.embyUserId}&api_key=${this.embyToken}`;
+    const url = `${this.embyUrl}/Items?IncludeItemTypes=Movie,Series&Recursive=true&Fields=Id,Name,ProductionYear,ProviderIds&Limit=10000&UserId=${this.embyUserId}&api_key=${this.embyToken}`;
     const response = await axios.get(url, { timeout: 20000 });
     return (response.data && response.data.Items) || [];
   }
@@ -288,16 +340,64 @@ class ListSyncService {
     return (response.data && response.data.Items) || [];
   }
 
-  // Same exact-then-year-stripped matching used by /api/refresh-all-collections
-  matchTitleToLibrary(title, libraryItems) {
+  // ID-first matching: an exact IMDB/TMDB match is unambiguous by definition, so it's
+  // tried before any string comparison at all. Title+year matching (below) only ever
+  // runs as a fallback for the rare case where neither side has an ID — which is also
+  // exactly the scenario most prone to the kind of mismatch that started this work
+  // (e.g. Scary Movie 2000 vs. 2026 sharing an identical bare name).
+  matchItemToLibrary(item, libraryItems) {
+    if (item.imdb) {
+      const idMatch = libraryItems.find(m => m.ProviderIds && (m.ProviderIds.Imdb || m.ProviderIds.IMDB) === item.imdb);
+      if (idMatch) return idMatch;
+    }
+    if (item.tmdb) {
+      const idMatch = libraryItems.find(m => m.ProviderIds && String(m.ProviderIds.Tmdb || m.ProviderIds.TMDB) === String(item.tmdb));
+      if (idMatch) return idMatch;
+    }
+    return this.matchTitleToLibrary(item.title, libraryItems, item.year);
+  }
+
+  // Same exact-then-year-stripped matching used by /api/refresh-all-collections,
+  // now disambiguated by release year when multiple library items share a bare
+  // name (e.g. a same-titled remake/reboot) — previously just took whichever
+  // candidate Array.find() happened to hit first, regardless of which was correct.
+  // sourceYear is an optional hint from Trakt/MDBlists, passed in separately rather
+  // than parsed from the title string, since titles here are always bare.
+  matchTitleToLibrary(title, libraryItems, sourceYear) {
     const exact = libraryItems.find(m => m.Name === title);
-    if (exact) return exact;
+
+    if (exact) {
+      // Even an exact name match can be the wrong movie if another library item
+      // shares the same bare name with a different year — check for that collision
+      // before trusting it.
+      if (sourceYear) {
+        const sameName = libraryItems.filter(m => m.Name === title);
+        if (sameName.length > 1) {
+          const yearMatched = sameName.find(m => m.ProductionYear === sourceYear);
+          if (yearMatched) return yearMatched;
+        }
+      }
+      return exact;
+    }
 
     const tClean = title.replace(/\s*\(\d{4}\)\s*$/, '').trim();
-    return libraryItems.find(m => {
+    const candidates = libraryItems.filter(m => {
       const movClean = (m.Name || '').replace(/\s*\(\d{4}\)\s*$/, '').trim();
       return movClean === tClean;
-    }) || null;
+    });
+
+    if (candidates.length === 0) return null;
+    if (candidates.length === 1) return candidates[0];
+
+    // Multiple same-named candidates — use the source's year to pick the right one
+    if (sourceYear) {
+      const yearMatched = candidates.find(m => m.ProductionYear === sourceYear);
+      if (yearMatched) return yearMatched;
+    }
+
+    // No year info to disambiguate (older data, or source didn't provide one) —
+    // falls back to the previous behavior, but this is now a known-ambiguous case
+    return candidates[0];
   }
 
   async addItemsToEmbyCollection(embyId, movieIds) {
@@ -308,6 +408,23 @@ class ListSyncService {
   async removeItemsFromEmbyCollection(embyId, movieIds) {
     const url = `${this.embyUrl}/Collections/${embyId}/Items?Ids=${movieIds.join(',')}&api_key=${this.embyToken}`;
     await axios.delete(url);
+  }
+
+  // Full teardown — used when a source list is confirmed gone (deleted or emptied)
+  // and the user has explicitly confirmed they want the orphaned Emby collection removed.
+  async deleteEmbyCollection(embyId) {
+    const url = `${this.embyUrl}/Items/${embyId}?api_key=${this.embyToken}`;
+    await axios.delete(url);
+  }
+
+  removeCollectionFromChrono(embyId) {
+    const collections = this.loadCollections();
+    const filtered = collections.filter(c => c.embyId !== embyId);
+    if (filtered.length !== collections.length) {
+      this.writeJSONAtomic(this.chronoPath, filtered);
+      return true;
+    }
+    return false;
   }
 
   // ═════════════════════════════════════════════
@@ -973,11 +1090,41 @@ class ListSyncService {
       addedToEmby: [],
       removedFromEmby: [],
       radarrQueued: [],
-      radarrWouldSend: false
+      radarrWouldSend: false,
+      listGone: false,
+      listGoneReason: null
     };
 
     try {
-      const newTitles = await this.fetchLatestTitles(coll, creds);
+      // Unliking someone else's list doesn't delete it or empty it — the list keeps
+      // existing exactly as before, just off your personal "liked" bookmark collection.
+      // So this needs its own check entirely separate from the fetch-then-validate
+      // logic below, which can only ever see "the list still has the same content."
+      if (coll.source === 'Trakt' && coll.sourceListIsLiked && options.likedListIds) {
+        const stillLiked = options.likedListIds.has(String(coll.sourceListId));
+        if (!stillLiked) {
+          result.listGone = true;
+          result.listGoneReason = 'unliked';
+          result.error = `No longer in your Trakt liked lists`;
+          return result;
+        }
+      }
+
+      let newTitles;
+      try {
+        newTitles = await this.fetchLatestTitles(coll, creds);
+      } catch (fetchErr) {
+        if (fetchErr.status === 404) {
+          // The list itself is gone, not just temporarily empty — distinct from a
+          // generic fetch failure, since this is something the user may want to
+          // act on (delete the now-orphaned Emby collection) rather than just retry.
+          result.listGone = true;
+          result.listGoneReason = 'deleted';
+          result.error = `${coll.source} list no longer exists (404) — it may have been deleted`;
+          return result;
+        }
+        throw fetchErr; // anything else (auth, network, rate limit) stays a generic failure
+      }
 
       if (coll._idHealed) {
         result.idHealed = true;
@@ -989,13 +1136,31 @@ class ListSyncService {
         return result;
       }
 
-      const uniqueNew = Array.from(new Set(newTitles.filter(Boolean)));
+      // newTitles is [{title, year, imdb, tmdb}, ...] from the fetch functions.
+      // Everything below that diffs/stores titles keeps using bare strings exactly
+      // as before — the richer data is only kept in a side lookup, used purely for
+      // matching further down, and is never written into coll.originalTitles/
+      // importedTitles. Changing the stored format itself would make every
+      // already-tracked title look simultaneously "removed" and "re-added" on the
+      // first sync after this change, which would trigger real deletions against
+      // Emby — not worth the risk.
+      const itemByTitle = new Map();
+      newTitles.forEach(r => {
+        if (r && r.title && !itemByTitle.has(r.title)) itemByTitle.set(r.title, r);
+      });
+      const flatTitles = newTitles.map(r => (r && r.title) || null);
+
+      const uniqueNew = Array.from(new Set(flatTitles.filter(Boolean)));
       const oldTitles = coll.importedTitles || coll.originalTitles || [];
 
       const validation = this.validateChanges(oldTitles.length, uniqueNew.length);
       result.warnings = validation.warnings;
       if (!validation.safe) {
         result.error = validation.warnings.join('; ');
+        if (oldTitles.length > 0 && uniqueNew.length === 0) {
+          result.listGone = true;
+          result.listGoneReason = 'empty';
+        }
         return result;
       }
 
@@ -1025,7 +1190,8 @@ class ListSyncService {
         for (const title of uniqueNew) {
           if (currentNames.has(title)) continue; // already in the Emby collection
 
-          const match = this.matchTitleToLibrary(title, libraryItems);
+          const item = itemByTitle.get(title) || { title, year: null, imdb: null, tmdb: null };
+          const match = this.matchItemToLibrary(item, libraryItems);
           if (match && !currentIds.has(match.Id)) {
             toAdd.push(match);
           } else if (!match) {
@@ -1064,15 +1230,24 @@ class ListSyncService {
         result.missingFromLibrary = stillMissing;
 
         // Persist the full picture onto the collection record itself —
-        // embyId stays the consistent key the rest of the app already uses
+        // embyId stays the consistent key the rest of the app already uses.
+        // itemIds is additive — a plain object, never touches the diff format
+        // above — but it's what lets /api/refresh-all-collections (a separate,
+        // webhook-triggered endpoint in server.js) do ID-first matching too,
+        // without needing to re-fetch from Trakt/MDBlists on every webhook trigger.
         coll.importedTitles = uniqueNew;
         coll.originalTitles = uniqueNew;
         coll.missingTitles = stillMissing;
+        coll.itemIds = Object.fromEntries(
+          Array.from(itemByTitle.entries()).map(([t, r]) => [t, { imdb: r.imdb || null, tmdb: r.tmdb || null }])
+        );
         coll.lastSourceFetch = new Date().toISOString();
       } else {
-        // Dry run — just report what's missing against the library snapshot
-        const libNames = new Set(libraryItems.map(m => m.Name));
-        result.missingFromLibrary = uniqueNew.filter(t => !libNames.has(t));
+        // Dry run — same ID-first matching as the real path, just without writing anything
+        result.missingFromLibrary = uniqueNew.filter(t => {
+          const item = itemByTitle.get(t) || { title: t, year: null, imdb: null, tmdb: null };
+          return !this.matchItemToLibrary(item, libraryItems);
+        });
       }
 
       // Send everything still missing to Radarr if this collection has it enabled,
@@ -1127,7 +1302,8 @@ class ListSyncService {
       totalRemovedFromEmby: 0,
       totalRadarrQueued: 0,
       collections: [],
-      errors: []
+      errors: [],
+      listGone: []
     };
 
     try {
@@ -1151,6 +1327,18 @@ class ListSyncService {
         this.logger.warn('List sync: could not fetch Emby library - ' + e.message);
       }
 
+      // Liked-list membership is checked once per sync, not once per collection —
+      // only bother fetching it at all if something actually needs it
+      let likedListIds = null;
+      const hasLikedListCollection = syncable.some(c => c.source === 'Trakt' && c.sourceListIsLiked);
+      if (hasLikedListCollection) {
+        try {
+          likedListIds = await this.fetchTraktLikedListIds(creds);
+        } catch (e) {
+          this.logger.warn('List sync: could not verify liked-list membership - ' + e.message);
+        }
+      }
+
       if (!dryRun) this.backupCollections();
 
       let anyIdHealed = false;
@@ -1161,7 +1349,8 @@ class ListSyncService {
         const result = await this.syncCollection(coll, creds, libraryItems, {
           dryRun,
           globalRadarr: !!config.autoRadarr,
-          globalRadarrServerId: config.radarrServerId
+          globalRadarrServerId: config.radarrServerId,
+          likedListIds
         });
 
         if (result.idHealed) anyIdHealed = true;
@@ -1176,6 +1365,9 @@ class ListSyncService {
           summary.collectionsFailed++;
           summary.errors.push({ name: coll.name, error: result.error });
           this.logger.warn(`   • ${coll.name} (${coll.source}): FAILED — ${result.error}`);
+          if (result.listGone) {
+            summary.listGone.push({ id: coll.embyId, name: coll.name, source: coll.source, reason: result.listGoneReason });
+          }
           continue;
         }
 

@@ -8,10 +8,11 @@ const path = require('path');
 const { v4: uuidv4 } = require('uuid');
 
 class Scheduler {
-  constructor(embyClient, rulesEngine, logger) {
+  constructor(embyClient, rulesEngine, logger, listSyncService) {
     this.embyClient = embyClient;
     this.rulesEngine = rulesEngine;
     this.logger = logger;
+    this.listSyncService = listSyncService;
     this.schedules = new Map();
     this.executions = [];
     this.dataDir = path.join(__dirname, '..', 'data');
@@ -251,6 +252,54 @@ class Scheduler {
       execution.itemsMatched = finalItems.length;
       execution.playlistId = collection.id;
 
+      // Publish to Trakt/MDBlists if this schedule has it enabled — runs on every
+      // execution (manual or cron), so the external list stays in step automatically
+      if ((schedule.publishToTrakt || schedule.publishToMDBlists) && this.listSyncService) {
+        try {
+          const publishItems = finalItems.map(i => ({
+            name: i.Name,
+            imdb: i.ProviderIds && (i.ProviderIds.Imdb || i.ProviderIds.IMDB) || null,
+            tmdb: i.ProviderIds && (i.ProviderIds.Tmdb || i.ProviderIds.TMDB) || null
+          })).filter(i => i.imdb || i.tmdb);
+
+          const publishResult = await this.listSyncService.publishSmartList(schedule, publishItems);
+
+          // Persist any newly-created (or recreated, if deleted externally) list
+          // ids/URLs back onto the schedule, so a self-healed URL sticks too
+          let scheduleChanged = false;
+          if (publishResult.traktListId && publishResult.traktListId !== schedule.traktListId) {
+            schedule.traktListId = publishResult.traktListId;
+            scheduleChanged = true;
+          }
+          if (publishResult.mdblistListId && publishResult.mdblistListId !== schedule.mdblistListId) {
+            schedule.mdblistListId = publishResult.mdblistListId;
+            scheduleChanged = true;
+          }
+          if (publishResult.traktListUrl && publishResult.traktListUrl !== schedule.traktListUrl) {
+            schedule.traktListUrl = publishResult.traktListUrl;
+            scheduleChanged = true;
+          }
+          if (publishResult.mdblistListUrl && publishResult.mdblistListUrl !== schedule.mdblistListUrl) {
+            schedule.mdblistListUrl = publishResult.mdblistListUrl;
+            scheduleChanged = true;
+          }
+          if (scheduleChanged) this.saveSchedules();
+
+          execution.publishResult = {
+            traktAdded: publishResult.traktAdded,
+            traktRemoved: publishResult.traktRemoved,
+            traktListUrl: publishResult.traktListUrl || schedule.traktListUrl || null,
+            mdblistAdded: publishResult.mdblistAdded,
+            mdblistRemoved: publishResult.mdblistRemoved,
+            mdblistListUrl: publishResult.mdblistListUrl || schedule.mdblistListUrl || null
+          };
+
+          this.logger.info(`   ✓ Published "${schedule.playlistName}": Trakt +${publishResult.traktAdded}/-${publishResult.traktRemoved}, MDBlists +${publishResult.mdblistAdded}/-${publishResult.mdblistRemoved}`);
+        } catch (e) {
+          this.logger.warn(`   Smart list publish failed for "${schedule.playlistName}": ${e.message}`);
+        }
+      }
+
       // Update schedule
       schedule.lastRun = new Date().toISOString();
       schedule.nextRun = this.calculateNextRun(schedule.cronExpression);
@@ -282,7 +331,8 @@ class Scheduler {
           status: execution.status,
           itemsMatched: execution.itemsMatched,
           error: execution.error,
-          completedAt: execution.completedAt
+          completedAt: execution.completedAt,
+          publishResult: execution.publishResult || null
         }
       };
     } catch (error) {

@@ -69,6 +69,7 @@ function writeSmartRegistry(registry) {
 
 // Look for HTML in same directory as server.js
 const htmlPath = path.join(__dirname, 'emby-playlist-manager.html');
+const faviconPath = path.join(__dirname, 'favicon.ico');
 console.log(`\n📂 Looking for HTML at: ${htmlPath}`);
 console.log(`📂 Server directory (__dirname): ${__dirname}`);
 console.log(`📂 Files in directory:`);
@@ -111,6 +112,15 @@ app.get('/', (req, res) => {
       console.log(`   ✓ HTML sent successfully`);
     }
   });
+});
+
+// Browsers request this automatically — without an explicit route, Express has
+// no static-file serving set up at all, so this would otherwise just 404
+app.get('/favicon.ico', (req, res) => {
+  if (!fs.existsSync(faviconPath)) {
+    return res.status(404).end();
+  }
+  res.sendFile(faviconPath);
 });
 
 // ═════════════════════════════════════════════
@@ -1033,7 +1043,7 @@ app.post('/api/refresh-all-collections', async (req, res) => {
     // Get all library movies once (for efficiency)
     let libraryMovies = [];
     try {
-      const libraryUrl = `${embyUrl}/Items?IncludeItemTypes=Movie&Recursive=true&Fields=Id,Name,ProductionYear&Limit=5000&UserId=${userId}&api_key=${embyToken}`;
+      const libraryUrl = `${embyUrl}/Items?IncludeItemTypes=Movie&Recursive=true&Fields=Id,Name,ProductionYear,ProviderIds&Limit=5000&UserId=${userId}&api_key=${embyToken}`;
       const embyResponse = await axios.get(libraryUrl);
       libraryMovies = (embyResponse.data && embyResponse.data.Items) || [];
       logger.info(`   📚 Loaded ${libraryMovies.length} movies from Emby library`);
@@ -1070,33 +1080,23 @@ app.post('/api/refresh-all-collections', async (req, res) => {
 
         logger.info(`   🔍 Searching for ${missingTitles.length} missing titles...`);
 
-        // Fuzzy match missing titles to library movies
+        // Same ID-first matching as the scheduled/manual sync path (listSyncService),
+        // not a separate copy — this also retires the old substring-prefix fallback
+        // that used to cause false positives (e.g. "Spider-Man" matching
+        // "Spider-Man: No Way Home" via prefix matching alone).
+        const itemIds = coll.itemIds || {};
         const matched = [];
         let notFoundCount = 0;
-        
+
         for (const title of missingTitles) {
           const movieInCollection = currentNames.has(title);
           if (movieInCollection) {
             continue;
           }
 
-          // Find best match in library
-          const match = libraryMovies.find(mov => {
-            const movTitle = mov.Name || '';
-            
-            // Exact match
-            if (movTitle === title) return true;
-            
-            // Clean titles (remove year suffix)
-            const tClean = title.replace(/\s*\(\d{4}\)\s*$/, '').trim();
-            const movClean = movTitle.replace(/\s*\(\d{4}\)\s*$/, '').trim();
-            
-            if (movClean === tClean) return true;
-            if (movClean.indexOf(tClean) === 0) return true;
-            if (tClean.indexOf(movClean) === 0) return true;
-            
-            return false;
-          });
+          const ids = itemIds[title] || {};
+          const item = { title, year: null, imdb: ids.imdb || null, tmdb: ids.tmdb || null };
+          const match = listSyncService.matchItemToLibrary(item, libraryMovies);
 
           if (match && !currentIds.has(match.Id)) {
             matched.push({ Id: match.Id, Name: match.Name });
@@ -1229,6 +1229,32 @@ app.get('/api/chrono/missing-lists', (req, res) => {
     res.json({ success: true, lists });
   } catch (error) {
     logger.error('Missing lists fetch error', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Explicit, user-confirmed teardown — deletes the Emby collection itself AND its
+// chrono-collections.json entry. Only ever called after the user has confirmed in
+// the UI that a source list is genuinely gone (deleted or emptied), never automatic.
+app.post('/api/chrono/collections/:embyId/teardown', async (req, res) => {
+  try {
+    const embyId = req.params.embyId;
+    let embyDeleted = false;
+
+    try {
+      await listSyncService.deleteEmbyCollection(embyId);
+      embyDeleted = true;
+    } catch (e) {
+      // If Emby already doesn't have it (e.g. manually deleted there too), that's
+      // fine — still proceed to clean up our own stored data either way.
+      logger.warn(`Could not delete Emby collection ${embyId} (may already be gone): ${e.message}`);
+    }
+
+    const dataRemoved = listSyncService.removeCollectionFromChrono(embyId);
+
+    res.json({ success: true, embyDeleted, dataRemoved });
+  } catch (error) {
+    logger.error('Collection teardown failed', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
